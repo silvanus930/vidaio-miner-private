@@ -70,9 +70,20 @@ COMPRESSION_CQ_BY_TYPE = {
 # Adaptive CQ search: probe a handful of CQ values against real VMAF instead
 # of trusting the static table above, so the encode lands just above the
 # requested threshold (maximizing compression credit) instead of guessing.
+# The real validator scores with the VMAF NEG model (services/scoring/vmaf_metric.py:
+# model='version=vmaf_v0.6.1neg'), not the standard model -- measured ~2.2-2.5
+# points lower than standard on identical output for both encoders tested. The
+# search must optimize against the same metric that will actually grade it, or
+# it silently overestimates its safety margin against the hard-fail cutoff.
 VMAF_MODEL_PATH = os.getenv(
-    "VMAF_MODEL_PATH", "/usr/local/share/vmaf/model/vmaf_v0.6.1.json"
+    "VMAF_MODEL_PATH", "/usr/local/share/vmaf/model/vmaf_v0.6.1neg.json"
 )
+# libvmaf defaults to n_threads=0 (effectively single-threaded), measured at
+# ~12s for a 10s clip on this host vs ~4.4s at n_threads=4 -- identical VMAF
+# output, no accuracy cost, just a config default nobody had set. 4 is a mild
+# oversubscription at MAX_CONCURRENT=5 on a 14-core host and was the tested
+# value; override via env if the deployment's core count differs a lot.
+VMAF_N_THREADS = int(os.getenv("VMAF_N_THREADS", "4"))
 CQ_SEARCH_ENABLED = os.getenv("COMPRESSION_CQ_SEARCH_ENABLED", "true").lower() in (
     "1",
     "true",
@@ -80,6 +91,12 @@ CQ_SEARCH_ENABLED = os.getenv("COMPRESSION_CQ_SEARCH_ENABLED", "true").lower() i
 )
 CQ_SEARCH_MAX_ITERS = int(os.getenv("COMPRESSION_CQ_SEARCH_MAX_ITERS", "6"))
 CQ_SEARCH_MAX_SECONDS = float(os.getenv("COMPRESSION_CQ_SEARCH_MAX_SECONDS", "90"))
+# Hard per-subprocess ceiling so one hung ffmpeg/vmaf call (GPU/driver glitch)
+# can't block the whole request indefinitely -- CQ_SEARCH_MAX_SECONDS is only
+# checked *between* probes, so without this a single stuck call defeats it.
+CQ_SEARCH_PROBE_TIMEOUT_SECONDS = float(
+    os.getenv("COMPRESSION_CQ_SEARCH_PROBE_TIMEOUT_SECONDS", "45")
+)
 CQ_SEARCH_MAX_DURATION_SECONDS = float(
     os.getenv("COMPRESSION_CQ_SEARCH_MAX_DURATION_SECONDS", "120")
 )
@@ -209,6 +226,15 @@ CODEC_MAP = {
     "VP9": "libvpx-vp9",
 }
 
+# Software SVT-AV1 beats NVENC's AV1 encoder in rate-distortion efficiency at
+# a given quality target (better compression per byte), at the cost of encode
+# speed. Validated across the full 22-video sample sweep: avg score 0.2185
+# (NVENC-adaptive) -> 0.2411 (SVT-AV1-adaptive), 17 better/5 worse/0 tied,
+# max 40.5s search time (90s budget, 180s real validator timeout) and 22.5s
+# for a real 5-item concurrent batch. Set to "nvenc" to revert.
+AV1_ENCODER_MODE = os.getenv("COMPRESSION_AV1_ENCODER", "svt").lower()
+SVT_AV1_PRESET = int(os.getenv("SVT_AV1_PRESET", "8"))
+
 
 def _is_url(path: str) -> bool:
     return path.startswith("http://") or path.startswith("https://")
@@ -309,7 +335,7 @@ def _format_process_output(stdout: bytes, stderr: bytes) -> str:
 
 
 async def _run_process(
-    cmd: list[str], task_label: str, step: str
+    cmd: list[str], task_label: str, step: str, timeout: float | None = None
 ) -> tuple[int | None, bytes, bytes, str]:
     try:
         log.info(f"[{task_label}] {step}: {' '.join(cmd)}")
@@ -318,7 +344,16 @@ async def _run_process(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            with suppress(ProcessLookupError):
+                proc.kill()
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+            return None, b"", b"", f"{step} timed out after {timeout}s"
         return proc.returncode, stdout, stderr, ""
     except FileNotFoundError:
         return None, b"", b"", f"{cmd[0]} binary not found"
@@ -415,15 +450,19 @@ def _build_ffmpeg_args(
         encoder,
     ]
 
+    is_svt = encoder == "libsvtav1"
+
     if req.codec_mode == "VBR" and req.target_bitrate:
         ffmpeg_args.extend(["-b:v", str(req.target_bitrate)])
         # Bitrate is fixed in VBR mode, so the only quality lever left is
-        # encoder effort. Default to a slower/higher-quality NVENC preset
-        # instead of the CRF-tuned default, unless the caller overrode it.
-        preset = "p6" if req.preset == "p4" else req.preset
+        # encoder effort. Default to a slower/higher-quality preset instead
+        # of the CRF-tuned default, unless the caller overrode it.
+        preset = str(SVT_AV1_PRESET) if is_svt else ("p6" if req.preset == "p4" else req.preset)
     else:
-        ffmpeg_args.extend(["-cq", str(resolved_cq)])
-        preset = req.preset
+        # SVT-AV1 uses -crf (0-63, same direction as NVENC's -cq: lower =
+        # higher quality) instead of NVENC's -cq flag.
+        ffmpeg_args.extend(["-crf" if is_svt else "-cq", str(resolved_cq)])
+        preset = str(SVT_AV1_PRESET) if is_svt else req.preset
 
     ffmpeg_args.extend(["-preset", preset])
 
@@ -458,13 +497,13 @@ async def _measure_vmaf(
         "-i",
         reference_path,
         "-lavfi",
-        f"[0:v][1:v]libvmaf=model=path={VMAF_MODEL_PATH}",
+        f"[0:v][1:v]libvmaf=model=path={VMAF_MODEL_PATH}:n_threads={VMAF_N_THREADS}",
         "-f",
         "null",
         "-",
     ]
     returncode, stdout, stderr, run_error = await _run_process(
-        cmd, task_label, "vmaf probe"
+        cmd, task_label, "vmaf probe", timeout=CQ_SEARCH_PROBE_TIMEOUT_SECONDS
     )
     if returncode != 0 or run_error:
         return None
@@ -484,7 +523,7 @@ async def _encode_cq_probe(
     probe_req = req.model_copy(update={"cq": cq})
     cmd = _build_ffmpeg_args(local_input, probe_path, probe_req, encoder)
     returncode, stdout, stderr, run_error = await _run_process(
-        cmd, task_label, f"cq probe cq={cq}"
+        cmd, task_label, f"cq probe cq={cq}", timeout=CQ_SEARCH_PROBE_TIMEOUT_SECONDS
     )
     if returncode != 0 or run_error or not os.path.exists(probe_path):
         return None
@@ -1200,6 +1239,8 @@ async def _compress_one(
 ) -> CompressResponse:
     remote_mode = _is_url(input_video)
     encoder = CODEC_MAP.get(req.codec.upper(), "av1_nvenc")
+    if req.codec.upper() == "AV1" and AV1_ENCODER_MODE == "svt":
+        encoder = "libsvtav1"
     resolved_cq = resolve_compression_cq(
         explicit_cq=req.cq,
         compression_type=req.compression_type,
