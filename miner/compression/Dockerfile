@@ -32,6 +32,14 @@ RUN git clone --depth 1 --branch v4.1.0 https://gitlab.com/AOMediaCodec/SVT-AV1.
     && make -j$(nproc) && make install && ldconfig \
     && cd ../.. && rm -rf SVT-AV1
 
+# libvmaf (quality measurement, used at runtime to target VMAF adaptively)
+RUN git clone --depth 1 --branch v3.0.0 https://github.com/Netflix/vmaf.git \
+    && cd vmaf/libvmaf && meson setup build --buildtype release -Denable_avx512=false \
+    && ninja -C build && ninja -C build install && ldconfig \
+    && mkdir -p /usr/local/share/vmaf/model \
+    && cp -r ../model/* /usr/local/share/vmaf/model/ \
+    && cd ../.. && rm -rf vmaf
+
 # Build ffmpeg (pinned commit 33b215d) with CUDA + x264 + x265 + dav1d + svtav1
 RUN export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH" \
     && git init ffmpeg && cd ffmpeg \
@@ -45,6 +53,7 @@ RUN export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib/x86_64-linux
         --enable-libvpx \
         --enable-libdav1d \
         --enable-libsvtav1 \
+        --enable-libvmaf \
         --enable-nonfree \
         --enable-cuda-nvcc \
         --enable-nvenc \

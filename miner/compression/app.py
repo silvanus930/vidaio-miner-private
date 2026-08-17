@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
+import re
 import shutil
 import time
 import uuid
@@ -64,6 +66,25 @@ COMPRESSION_CQ_BY_TYPE = {
     "Medium": 35,
     "High": 30,
 }
+
+# Adaptive CQ search: probe a handful of CQ values against real VMAF instead
+# of trusting the static table above, so the encode lands just above the
+# requested threshold (maximizing compression credit) instead of guessing.
+VMAF_MODEL_PATH = os.getenv(
+    "VMAF_MODEL_PATH", "/usr/local/share/vmaf/model/vmaf_v0.6.1.json"
+)
+CQ_SEARCH_ENABLED = os.getenv("COMPRESSION_CQ_SEARCH_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+CQ_SEARCH_MAX_ITERS = int(os.getenv("COMPRESSION_CQ_SEARCH_MAX_ITERS", "6"))
+CQ_SEARCH_MAX_SECONDS = float(os.getenv("COMPRESSION_CQ_SEARCH_MAX_SECONDS", "90"))
+CQ_SEARCH_MAX_DURATION_SECONDS = float(
+    os.getenv("COMPRESSION_CQ_SEARCH_MAX_DURATION_SECONDS", "120")
+)
+CQ_SEARCH_MIN = 18
+CQ_SEARCH_MAX = 51
 
 # Storage provider label only. Uploads use one S3-compatible code path.
 STORAGE_PROVIDER = os.getenv("MINER_STORAGE_PROVIDER", "s3").lower()
@@ -396,10 +417,15 @@ def _build_ffmpeg_args(
 
     if req.codec_mode == "VBR" and req.target_bitrate:
         ffmpeg_args.extend(["-b:v", str(req.target_bitrate)])
+        # Bitrate is fixed in VBR mode, so the only quality lever left is
+        # encoder effort. Default to a slower/higher-quality NVENC preset
+        # instead of the CRF-tuned default, unless the caller overrode it.
+        preset = "p6" if req.preset == "p4" else req.preset
     else:
         ffmpeg_args.extend(["-cq", str(resolved_cq)])
+        preset = req.preset
 
-    ffmpeg_args.extend(["-preset", req.preset])
+    ffmpeg_args.extend(["-preset", preset])
 
     video_filters = []
     if req.target_width and req.target_height:
@@ -414,6 +440,196 @@ def _build_ffmpeg_args(
         ["-c:a", "copy", "-sn", "-dn", "-movflags", "+faststart", output_path]
     )
     return ffmpeg_args
+
+
+_VMAF_SCORE_RE = re.compile(r"VMAF score:\s*([\d.]+)")
+
+
+async def _measure_vmaf(
+    reference_path: str, distorted_path: str, task_label: str
+) -> float | None:
+    """Real VMAF of distorted_path against reference_path, or None on failure."""
+    cmd = [
+        FFMPEG_BIN,
+        "-hide_banner",
+        "-y",
+        "-i",
+        distorted_path,
+        "-i",
+        reference_path,
+        "-lavfi",
+        f"[0:v][1:v]libvmaf=model=path={VMAF_MODEL_PATH}",
+        "-f",
+        "null",
+        "-",
+    ]
+    returncode, stdout, stderr, run_error = await _run_process(
+        cmd, task_label, "vmaf probe"
+    )
+    if returncode != 0 or run_error:
+        return None
+    match = _VMAF_SCORE_RE.search(stderr.decode(errors="replace"))
+    return float(match.group(1)) if match else None
+
+
+async def _encode_cq_probe(
+    local_input: str,
+    cq: int,
+    req: "CompressRequest",
+    encoder: str,
+    task_label: str,
+    tmp_dir: str,
+) -> str | None:
+    probe_path = os.path.join(tmp_dir, f"probe_cq{cq}.mp4")
+    probe_req = req.model_copy(update={"cq": cq})
+    cmd = _build_ffmpeg_args(local_input, probe_path, probe_req, encoder)
+    returncode, stdout, stderr, run_error = await _run_process(
+        cmd, task_label, f"cq probe cq={cq}"
+    )
+    if returncode != 0 or run_error or not os.path.exists(probe_path):
+        return None
+    return probe_path
+
+
+def _estimate_compression_score(
+    original_size: int, compressed_size: int, vmaf: float, vmaf_threshold: float
+) -> float:
+    """Mirrors the validator's compression scoring formula (docs/incentive_mechanism.md)
+    so the search can optimize the real objective instead of a VMAF proxy.
+    Maximizing "VMAF just above threshold" is NOT the same as maximizing this
+    score everywhere in the curve: at low compression ratios the quality
+    component (weight 0.3, linear in VMAF) can outweigh the marginal
+    compression gain (weight 0.7, but sub-linear via the exponent) from
+    pushing VMAF down toward the threshold. Only a direct score search gets
+    this right in every regime.
+    """
+    if original_size <= 0 or compressed_size <= 0:
+        return 0.0
+    c = compressed_size / original_size
+    if c >= 0.80:
+        return 0.0
+    hard_cutoff = vmaf_threshold - 5
+    if vmaf < hard_cutoff:
+        return 0.0
+    r = 1.0 / c
+    if vmaf >= vmaf_threshold:
+        quality_component = 0.7 + 0.3 * min(
+            1.0, (vmaf - vmaf_threshold) / (100 - vmaf_threshold)
+        )
+        if r <= 20:
+            compression_component = ((r - 1.25) / 18.75) ** 0.9
+        else:
+            compression_component = 1.0 + 0.1 * math.log(r / 20)
+        return min(1.0, (0.7 * compression_component + 0.3 * quality_component) / 1.12)
+    soft_zone_position = (vmaf - hard_cutoff) / 5
+    quality_factor = 0.7 * soft_zone_position**2
+    if r <= 20:
+        compression_component = ((r - 1) / 19) ** 1.5
+    else:
+        compression_component = 1.0 + 0.3 * math.log(r / 20)
+    return min(1.0, compression_component * quality_factor / 1.12)
+
+
+async def _search_cq_for_max_score(
+    local_input: str,
+    req: "CompressRequest",
+    encoder: str,
+    task_label: str,
+) -> int:
+    """Local search over AV1 CQ that directly maximizes the real compression
+    score (probe-encode, measure real size + VMAF, score it), instead of
+    trusting a fixed per-band guess. Starts near the static table's value and
+    does coordinate-ascent with a shrinking step. Falls back to the static
+    table on any probe failure, timeout, or if nothing scores above zero.
+    """
+    fallback_cq = resolve_compression_cq(
+        explicit_cq=None,
+        compression_type=req.compression_type,
+        vmaf_threshold=req.vmaf_threshold,
+    )
+    if not CQ_SEARCH_ENABLED or req.vmaf_threshold is None:
+        return fallback_cq
+
+    try:
+        original_size = os.path.getsize(local_input)
+    except OSError:
+        return fallback_cq
+    if original_size <= 0:
+        return fallback_cq
+
+    tmp_dir = os.path.join(SHARED_VOLUME_PATH, f"{task_label}_cqsearch")
+    os.makedirs(tmp_dir, exist_ok=True)
+    start = time.monotonic()
+    tried: dict[int, float] = {}
+
+    async def probe_score(cq: int) -> None:
+        if cq in tried or time.monotonic() - start > CQ_SEARCH_MAX_SECONDS:
+            return
+        probe_path = await _encode_cq_probe(
+            local_input, cq, req, encoder, task_label, tmp_dir
+        )
+        if probe_path is None:
+            tried[cq] = 0.0
+            return
+        try:
+            compressed_size = os.path.getsize(probe_path)
+            vmaf = await _measure_vmaf(local_input, probe_path, task_label)
+        finally:
+            _cleanup(probe_path)
+        if vmaf is None:
+            tried[cq] = 0.0
+            return
+        s = _estimate_compression_score(
+            original_size, compressed_size, vmaf, req.vmaf_threshold
+        )
+        tried[cq] = s
+        log.info(
+            f"[{task_label}] cq search probe cq={cq} vmaf={vmaf:.2f} "
+            f"score_est={s:.4f}"
+        )
+
+    try:
+        center = min(max(fallback_cq, CQ_SEARCH_MIN), CQ_SEARCH_MAX)
+        step = 6
+        for cq in {
+            max(CQ_SEARCH_MIN, center - step),
+            center,
+            min(CQ_SEARCH_MAX, center + step),
+        }:
+            await probe_score(cq)
+
+        while len(tried) < CQ_SEARCH_MAX_ITERS:
+            if not tried or time.monotonic() - start > CQ_SEARCH_MAX_SECONDS:
+                break
+            best_cq = max(tried, key=tried.get)
+            neighbors = [
+                c
+                for c in (best_cq - step, best_cq + step)
+                if CQ_SEARCH_MIN <= c <= CQ_SEARCH_MAX and c not in tried
+            ]
+            if not neighbors:
+                if step == 1:
+                    break
+                step = max(1, step // 2)
+                neighbors = [
+                    c
+                    for c in (best_cq - step, best_cq + step)
+                    if CQ_SEARCH_MIN <= c <= CQ_SEARCH_MAX and c not in tried
+                ]
+                if not neighbors:
+                    break
+            for c in neighbors:
+                await probe_score(c)
+            step = max(1, step // 2)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if not tried:
+        return fallback_cq
+    best_cq = max(tried, key=tried.get)
+    if tried[best_cq] <= 0.0:
+        return fallback_cq
+    return best_cq
 
 
 def _should_chunk(req: "CompressRequest", duration_seconds: float | None) -> bool:
@@ -1044,6 +1260,24 @@ async def _compress_one(
 
             duration_seconds = await _probe_duration_seconds(local_input, task_label)
             use_chunked = _should_chunk(req, duration_seconds)
+
+            if (
+                CQ_SEARCH_ENABLED
+                and req.codec_mode != "VBR"
+                and req.vmaf_threshold is not None
+                and req.cq is None
+                and not use_chunked
+                and (
+                    duration_seconds is None
+                    or duration_seconds <= CQ_SEARCH_MAX_DURATION_SECONDS
+                )
+            ):
+                searched_cq = await _search_cq_for_max_score(
+                    local_input, req, encoder, task_label
+                )
+                log.info(f"[{task_label}] adaptive cq search selected cq={searched_cq}")
+                req.cq = searched_cq
+                resolved_cq = searched_cq
 
             async with _running_task() as running_snapshot:
                 log.info(
