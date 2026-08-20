@@ -1126,9 +1126,32 @@ async def _search_cq_for_max_score(
                 and _time_for_another_probe()
             ):
                 vmaf1 = probed_vmaf[jump1]
-                slope_actual = (vmaf1 - vmaf0) / (jump1 - center)
-                if slope_actual < -0.1:
-                    delta2 = (vmaf1 - search_threshold) / (-slope_actual)
+                cq_gap = jump1 - center
+                slope_actual = (vmaf1 - vmaf0) / cq_gap
+                # A 1-cq baseline amplifies ordinary measurement noise into a
+                # wild slope estimate (observed live: a tiny "slope" off a
+                # 1-cq gap extrapolated to a jump 10 cq away, wasting the
+                # probe). Only trust the measured slope with a >=2-cq
+                # baseline; otherwise fall back to the pooled prior, which is
+                # noisier per-clip but bounded.
+                #
+                # A content-adaptive version of the margin below (shrinking
+                # it on demonstrably gentle-slope clips, using paired
+                # subsampled-vs-full-precision measurements that showed real
+                # noise is content-dependent) was tried and reverted: the
+                # *first* jump's direction is decided against the inflated
+                # margin-threshold, so on easy content it's already biased
+                # toward more-conservative before there's any evidence the
+                # content is easy, which undermines the adaptation before it
+                # can help. Fixing that needs the first jump's direction
+                # logic reworked too -- left as a scoped future project
+                # rather than iterating further on live search behavior.
+                slope_for_aim = (
+                    slope_actual if abs(cq_gap) >= 2 else -CQ_SEARCH_SLOPE_PRIOR
+                )
+                if slope_for_aim < -0.1:
+                    delta2 = (vmaf1 - search_threshold) / (-slope_for_aim)
+                    delta2 = max(-8.0, min(8.0, delta2))
                     jump2 = min(CQ_SEARCH_MAX, max(CQ_SEARCH_MIN, round(jump1 + delta2)))
                     if jump2 not in tried:
                         await probe_score(jump2)
