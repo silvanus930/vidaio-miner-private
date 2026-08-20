@@ -61,10 +61,98 @@ DISABLE_REMOTE_IO = os.getenv("DISABLE_REMOTE_IO", "false").lower() in (
 COMPETITION_INPUT_ROOT = os.getenv("COMPETITION_INPUT_ROOT", "/evaluation-inputs")
 COMPETITION_OUTPUT_ROOT = os.getenv("COMPETITION_OUTPUT_ROOT", "/output")
 DEFAULT_COMPRESSION_CQ = 35
+# HEVC Medium (threshold 89): the same calibration methodology used to fix
+# AV1's tables (explicit cq bypassing search, real score via the production
+# formula, real captured clips) found the same class of bug here -- cq=35
+# was landing 2 of 4 real clips at VMAF 84.6-85.0, right at the hard-cutoff
+# (84), scoring 0.0011-0.0027 (essentially zero). cq=30 kept every clip
+# safely in the full-credit zone (min real score 0.2783 vs cq=35's 0.0011;
+# mean 0.3255 vs 0.1790).
+# HEVC Low (threshold 85): the old default (40) was worse than Medium's bug --
+# real VMAF landed at 75-76 on every tested clip, below the hard-cutoff (80),
+# scoring 0.0000 across the board with zero exceptions. cq=35 fixed it (mean
+# 0.289, min 0.076 across 4 real clips). Also tested going more conservative
+# still (cq=30/32/33) in case there was headroom below 35 the way AV1's Low
+# tier had -- there wasn't: on the 2 clips tested at all four values, score
+# fell monotonically as cq decreased below 35 (clip1: 0.292/0.315/0.329/0.360
+# for cq=30/32/33/35; clip2: 0.293/0.315/0.328/0.359), because the formula's
+# 70% compression weight punishes the extra ratio cost of over-shooting the
+# threshold faster than the quality bonus repays it. cq=35 is a real optimum
+# here, not just "safe enough."
+# Both fixes only apply to CRF-mode requests -- real HEVC traffic observed
+# this session has mostly been VBR (which ignores this table entirely, see
+# the VBR branch in _build_ffmpeg_args), but the CRF path exists in the code
+# and would hit these same failures the moment a validator sends
+# codec_mode=CRF for HEVC.
 COMPRESSION_CQ_BY_TYPE = {
-    "Low": 40,
-    "Medium": 35,
+    "Low": 35,
+    "Medium": 30,
     "High": 30,
+}
+# AV1 (av1_nvenc) and HEVC (hevc_nvenc) do not share the same CQ-to-VMAF
+# curve at the same numeric CQ. These defaults are a ratchet: each value is
+# only ever promoted here after a real (non-synthetic) production search
+# probe confirms it's safe at that threshold, never guessed from local
+# testing (synthetic content's rate-distortion curve doesn't transfer --
+# confirmed repeatedly, e.g. a same-CQ probe landing ~90 VMAF on synthetic
+# content vs delivering ~9x the bitrate real content needed for a similar
+# VMAF). Round 1: HEVC cq=41 hard-fails at threshold 89 (VMAF ~84.6) while
+# AV1 cq=41 is comfortably safe at the same threshold (VMAF ~91.4-92.2) --
+# gave AV1 its own, higher table. Round 2: real search results confirmed
+# cq=41 safe at threshold 89 (promoted from the round-1 guess of 38) and
+# cq=46 safe at threshold 85 (promoted from 43).
+# Round 3 ("High", threshold>=93): a systematic calibration sweep (explicit
+# cq bypassing search, real score computed via the exact production formula)
+# across 5 real captured threshold-93 clips found cq=33 was actively wrong,
+# not just suboptimal -- it pushed VMAF below 93 on 2/5 clips, landing them
+# in the soft-zone where the score formula craters even 1 point under target
+# (min real score 0.0042 vs cq=30's 0.2063; mean 0.1592 vs cq=30's 0.2333).
+# cq=30 kept every one of the 5 clips at or above the full-credit VMAF>=93
+# line while still compressing to 0.44-0.71 ratio. cq=27 was tested too and
+# is worse in the other direction: 4/5 clips hit ratio>=0.80, the automatic
+# compression-side hard-fail -- confirming compression that's too gentle
+# zeroes the score exactly like VMAF that's too low does.
+# Round 4 ("Medium", threshold 89): the same calibration methodology found
+# the round-2 "confirmation" of cq=41 was wrong -- and wrong in a way that
+# reveals why: round 2 trusted the *adaptive search's own* subsampled,
+# margin-adjusted probe (n_subsample=6, search aiming for 89+margin rather
+# than 89 itself), which overestimated true VMAF enough to call cq=41 safe.
+# Full-precision recalibration (n_subsample=1, real score formula) across 3
+# real threshold-89 clips instead put cq=41 at real VMAF 83.5-86.0 -- at or
+# below the hard-cutoff (84) on every single one, scoring 0.0000-0.0095 (i.e.
+# essentially zero). cq=36 measured 88.3-90.1 VMAF on the same 3 clips,
+# scoring 0.02-0.27 -- a 20-30x real improvement, because it sits close
+# enough to the 89 target that most clips land at/above it instead of
+# camping in the hard-cutoff's shadow. This is now the more-trusted number
+# precisely because it came from the same ground-truth method that also
+# fixed "High" above, rather than from the search's own noisier signal.
+# Round 5 ("Low", threshold 85): calibration across 4 real clips revealed a
+# real content-difficulty split at this tier -- 2 clips stayed safely above
+# threshold even at cq=50 (the most aggressive tested), while the other 2
+# hard-cutoff-failed outright by cq=50 (VMAF 77.67/79.81, below the 80
+# floor). Across that split, cq=43 was strictly better than the round-2
+# default (46) on both worst-case AND average real score: min 0.4069 vs
+# 0.0838, mean 0.4381 vs 0.4042 -- 46 wasn't a middling choice, it was
+# dominated on every axis by the more conservative value. Untested below 43;
+# there may be further headroom, but 43 is already a clean win with no
+# tail risk in the tested range.
+# HEVC is untouched throughout -- no real evidence yet of what it can do
+# above cq=35, so it keeps discovering that incrementally via search.
+AV1_COMPRESSION_CQ_BY_TYPE = {
+    "Low": 43,
+    "Medium": 36,
+    "High": 30,
+}
+# SVT-AV1's CRF scale is numerically similar to NVENC's CQ scale but not the
+# same curve -- confirmed on real hard content that the NVENC-tuned "High"
+# center (33) explores a range (27-36) that never gets close to what SVT can
+# actually do: a manual test at crf=18 (well outside that range) reached
+# VMAF 94.10 vs the search's own best of 91.59 within the NVENC-calibrated
+# range. Only reachable via encoder_mode="svt" (organic job path).
+SVT_AV1_COMPRESSION_CQ_BY_TYPE = {
+    "Low": 30,
+    "Medium": 24,
+    "High": 18,
 }
 
 # Adaptive CQ search: probe a handful of CQ values against real VMAF instead
@@ -91,17 +179,129 @@ CQ_SEARCH_ENABLED = os.getenv("COMPRESSION_CQ_SEARCH_ENABLED", "true").lower() i
 )
 CQ_SEARCH_MAX_ITERS = int(os.getenv("COMPRESSION_CQ_SEARCH_MAX_ITERS", "6"))
 CQ_SEARCH_MAX_SECONDS = float(os.getenv("COMPRESSION_CQ_SEARCH_MAX_SECONDS", "90"))
+# Search probes measure VMAF with n_subsample > 1 at higher resolutions (see
+# _vmaf_subsample_for_resolution) to stay inside the timeout budget. That's a
+# noisier estimate than the validator's own check, and the search otherwise
+# targets "just barely above threshold" -- which then lands just barely
+# *below* the real threshold about as often as above it. Search against a
+# nudged-up threshold so the chosen CQ carries a margin proportional to how
+# much subsampling noise it was measured under.
+# Real production data (threshold-85 batch, n_subsample=6) showed the
+# original margin (0.5 + 0.2*6 = 1.7) still wasn't enough on hard/high-
+# motion content: probe estimates of ~81-82 delivered real VMAF of
+# ~79.7-82.5, a systematic ~1-2 point undershoot on 4 of 5 items, not just
+# random noise. Widened base/per-subsample so n_subsample=6 carries ~2.8
+# points of cushion instead of 1.7 -- still comfortably below the margins
+# seen on confirmed real wins (2.4+ points), so this shouldn't cost the
+# compression gains already validated in production.
+CQ_SEARCH_VMAF_MARGIN_BASE = float(
+    os.getenv("COMPRESSION_CQ_SEARCH_VMAF_MARGIN_BASE", "1.0")
+)
+CQ_SEARCH_VMAF_MARGIN_PER_SUBSAMPLE = float(
+    os.getenv("COMPRESSION_CQ_SEARCH_VMAF_MARGIN_PER_SUBSAMPLE", "0.3")
+)
+# The validator's dendrite call to us has a hard 180s timeout (neurons/
+# validator.py, call_miner_batch(..., timeout=180)) measured end-to-end,
+# including our miner's input download and output upload around this
+# service's own queueing+search+encode work. A response that arrives even a
+# few seconds late isn't scored low -- it's discarded entirely (empty URL ->
+# "invalid or missing distorted video file", final_score 0).
+# CQ_SEARCH_MAX_SECONDS alone doesn't protect against this: it bounds the
+# search loop but ignores time already burned queueing behind other
+# concurrent items, and the final encode after the search has no timeout at
+# all. Give _compress_one an overall deadline for its own queueing+search+
+# encode work and have both phases shrink to fit whatever actually remains,
+# instead of each independently assuming a full budget.
+#
+# Originally sized around a ~40s download / ~15s upload baseline (giving
+# 120s here). Real production data since then has shown download alone
+# regularly taking 60-80s under real network conditions (once measured at
+# 71s in a batch that totaled 196s and almost certainly missed the 180s
+# window) -- that baseline was too optimistic. Tightened to leave real
+# margin against that observed variance rather than the best case.
+COMPRESSION_OVERALL_DEADLINE_SECONDS = float(
+    os.getenv("COMPRESSION_OVERALL_DEADLINE_SECONDS", "90")
+)
+COMPRESSION_FINAL_ENCODE_RESERVE_SECONDS = float(
+    os.getenv("COMPRESSION_FINAL_ENCODE_RESERVE_SECONDS", "20")
+)
 # Hard per-subprocess ceiling so one hung ffmpeg/vmaf call (GPU/driver glitch)
 # can't block the whole request indefinitely -- CQ_SEARCH_MAX_SECONDS is only
 # checked *between* probes, so without this a single stuck call defeats it.
+# 60s (was 45s) is extra margin on top of the VMAF n_subsample fix below --
+# defense in depth, not the primary fix. Real production failure: a 4K probe
+# measured at 25.7s for a 10s clip with n_subsample=1 (0.41x realtime), which
+# scales past 45s for anything beyond ~18s of 4K footage.
 CQ_SEARCH_PROBE_TIMEOUT_SECONDS = float(
-    os.getenv("COMPRESSION_CQ_SEARCH_PROBE_TIMEOUT_SECONDS", "45")
+    os.getenv("COMPRESSION_CQ_SEARCH_PROBE_TIMEOUT_SECONDS", "60")
 )
 CQ_SEARCH_MAX_DURATION_SECONDS = float(
     os.getenv("COMPRESSION_CQ_SEARCH_MAX_DURATION_SECONDS", "120")
 )
 CQ_SEARCH_MIN = 18
 CQ_SEARCH_MAX = 51
+# Empirical |dVMAF/dcq| across every real (cq, vmaf) pair collected this
+# session, pooled over both codecs (n=48, mean 1.689, median 1.773, range
+# 0.44-2.68). Used only as the first-jump prior in the search below; the
+# second jump uses the clip's own measured local slope instead, which is
+# more accurate since real content varies by ~6x in how steep this curve is.
+CQ_SEARCH_SLOPE_PRIOR = 1.7
+
+# Every real probe (encode + VMAF measure) run by the search below is
+# training data for a future learned CQ predictor -- persisted on the host
+# bind mount (survives container rebuilds) so it accumulates across
+# redeploys instead of resetting with the container's own log buffer.
+# Lives under a reserved subdirectory (see PERSISTENT_DATA_DIR) that the
+# cleanup worker explicitly skips -- a one-off calibration log written
+# directly under SHARED_VOLUME_PATH was silently deleted by the cleanup
+# worker's TTL sweep (it walks the whole tree with no notion of "this file
+# isn't scratch data"), losing real calibration output before it could be
+# reused. This log file only survived that same sweep because its frequent
+# appends kept refreshing its mtime past the TTL window -- pure luck, not a
+# guarantee.
+PERSISTENT_DATA_DIR = os.path.join(SHARED_VOLUME_PATH, "_persistent")
+CQ_SEARCH_LOG_PATH = os.getenv(
+    "COMPRESSION_CQ_SEARCH_LOG_PATH",
+    os.path.join(PERSISTENT_DATA_DIR, "cq_search_log.jsonl"),
+)
+
+
+def _log_cq_search_sample(
+    *,
+    task_label: str,
+    codec: str,
+    encoder_mode: str | None,
+    compression_type: str | None,
+    vmaf_threshold: float | None,
+    resolution: tuple[int, int] | None,
+    n_subsample: int,
+    cq: int,
+    vmaf: float,
+    score_est: float,
+    original_size: int,
+    compressed_size: int,
+) -> None:
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "task": task_label,
+        "codec": codec,
+        "encoder_mode": encoder_mode,
+        "compression_type": compression_type,
+        "vmaf_threshold": vmaf_threshold,
+        "width": resolution[0] if resolution else None,
+        "height": resolution[1] if resolution else None,
+        "n_subsample": n_subsample,
+        "cq": cq,
+        "vmaf": vmaf,
+        "score_est": score_est,
+        "ratio": (compressed_size / original_size) if original_size else None,
+    }
+    try:
+        os.makedirs(PERSISTENT_DATA_DIR, exist_ok=True)
+        with open(CQ_SEARCH_LOG_PATH, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        log.warning(f"[{task_label}] failed to write cq search log sample: {exc}")
 
 # Storage provider label only. Uploads use one S3-compatible code path.
 STORAGE_PROVIDER = os.getenv("MINER_STORAGE_PROVIDER", "s3").lower()
@@ -189,6 +389,8 @@ def resolve_compression_cq(
     explicit_cq: int | None = None,
     compression_type: Literal["Low", "Medium", "High"] | None = None,
     vmaf_threshold: float | None = None,
+    codec: str | None = None,
+    encoder_mode: str | None = None,
 ) -> int:
     """Resolve CQ once for inference and competition requests.
 
@@ -196,16 +398,23 @@ def resolve_compression_cq(
     tier wins, followed by the VMAF target and the historical medium default.
     """
 
+    is_av1 = codec is not None and codec.upper() == "AV1"
+    if is_av1 and encoder_mode == "svt":
+        cq_by_type = SVT_AV1_COMPRESSION_CQ_BY_TYPE
+    elif is_av1:
+        cq_by_type = AV1_COMPRESSION_CQ_BY_TYPE
+    else:
+        cq_by_type = COMPRESSION_CQ_BY_TYPE
     if explicit_cq is not None:
         return explicit_cq
     if compression_type is not None:
-        return COMPRESSION_CQ_BY_TYPE[compression_type]
+        return cq_by_type[compression_type]
     if vmaf_threshold is not None:
         if vmaf_threshold >= 93:
-            return COMPRESSION_CQ_BY_TYPE["High"]
+            return cq_by_type["High"]
         if vmaf_threshold >= 89:
-            return COMPRESSION_CQ_BY_TYPE["Medium"]
-        return COMPRESSION_CQ_BY_TYPE["Low"]
+            return cq_by_type["Medium"]
+        return cq_by_type["Low"]
     return DEFAULT_COMPRESSION_CQ
 
 
@@ -226,14 +435,18 @@ CODEC_MAP = {
     "VP9": "libvpx-vp9",
 }
 
-# Software SVT-AV1 beats NVENC's AV1 encoder in rate-distortion efficiency at
-# a given quality target (better compression per byte), at the cost of encode
-# speed. Validated across the full 22-video sample sweep: avg score 0.2185
-# (NVENC-adaptive) -> 0.2411 (SVT-AV1-adaptive), 17 better/5 worse/0 tied,
-# max 40.5s search time (90s budget, 180s real validator timeout) and 22.5s
-# for a real 5-item concurrent batch. Set to "nvenc" to revert.
-AV1_ENCODER_MODE = os.getenv("COMPRESSION_AV1_ENCODER", "svt").lower()
-SVT_AV1_PRESET = int(os.getenv("SVT_AV1_PRESET", "8"))
+# Software SVT-AV1 vs NVENC on the synchronous (scored, 180s-budgeted) path:
+# marginal and inconsistent under fast presets, not worth the latency --
+# stays "nvenc" here, and only the organic job/poll path (minutes-scale
+# budget, CompressRequest.encoder_mode="svt", not scored synthetic traffic)
+# ever opts into "svt". On that path the tradeoff is different: a real
+# production hard clip measured SVT beating NVENC on both axes at once
+# (smaller file *and* higher VMAF at the same bitrate) once given a genuinely
+# slow preset -- preset 8 (SVT's -2..13 scale, lower=slower/better) is
+# actually a *fast*, low-quality setting despite the number looking
+# conservative; preset 4 is what produced the real win.
+AV1_ENCODER_MODE = os.getenv("COMPRESSION_AV1_ENCODER", "nvenc").lower()
+SVT_AV1_PRESET = int(os.getenv("SVT_AV1_PRESET", "4"))
 
 
 def _is_url(path: str) -> bool:
@@ -386,6 +599,109 @@ async def _probe_duration_seconds(path: str, task_label: str) -> float | None:
         return None
 
 
+async def _probe_resolution(path: str, task_label: str) -> tuple[int, int] | None:
+    cmd = [
+        FFPROBE_BIN,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=p=0",
+        path,
+    ]
+    returncode, stdout, stderr, run_error = await _run_process(
+        cmd, task_label, "ffprobe resolution"
+    )
+    if returncode != 0 or run_error:
+        return None
+    try:
+        w_str, h_str = stdout.decode().strip().split(",")[:2]
+        return int(w_str), int(h_str)
+    except (ValueError, IndexError):
+        return None
+
+
+def _vmaf_subsample_for_resolution(
+    width: int, height: int, available_seconds: float | None = None
+) -> int:
+    """VMAF (CPU-bound) measured at ~0.41x realtime on 4K vs generously
+    faster than realtime at <=1080p on this host -- a single probe on a
+    full-length clip can exceed the per-probe timeout outright, and did in
+    production (see the 2026-08-17 10:48 UTC batch: 0 successful probes
+    logged, silent fallback to the static table, 4/5 items landed below the
+    VMAF threshold as a direct result). Subsampling frames during the SEARCH
+    only (never for anything already scored/returned) cuts compute
+    proportionally with negligible score deltas (measured: 99.96 -> 99.83 at
+    5x on a real 4K clip) since VMAF's harmonic mean is stable under
+    sparse-but-regular sampling.
+
+    The exact same failure mode recurred on 2026-08-19/20: a real batch
+    where the download phase alone consumed ~100s of the validator's 180s
+    wall left too little of the remaining budget for even one probe to
+    finish at the fixed subsample level under 5-way concurrent load -- 0/5
+    items got any search refinement, all fell back to the static table,
+    leaving real, measured VMAF headroom (8-13 points above threshold) on
+    the table purely because nothing had time to probe for it. Scaling
+    n_subsample coarser as available_seconds shrinks trades measurement
+    precision for a real chance to complete at least one probe, rather than
+    a guaranteed zero -- reusing the existing margin mechanism
+    (CQ_SEARCH_VMAF_MARGIN_PER_SUBSAMPLE already widens the safety margin
+    proportionally to n_subsample) instead of adding a new one.
+    """
+    pixels = width * height
+    if pixels > 1920 * 1080:
+        base = 6
+        if available_seconds is not None:
+            if available_seconds < 40:
+                base = 12
+            elif available_seconds < 70:
+                base = 9
+        return base
+    if pixels > 1280 * 720:
+        base = 2
+        if available_seconds is not None and available_seconds < 40:
+            base = 4
+        return base
+    return 1
+
+
+def _size_based_cq_bonus(
+    vmaf_threshold: float | None,
+    codec: str | None,
+    resolution: tuple[int, int] | None,
+    original_size: int,
+) -> int:
+    """Free per-clip difficulty signal -- the reference file's own size is
+    already known before any computation runs, and correlates strongly
+    (r=0.755, measured on 7 real 4K clips at the Low tier) with how much
+    VMAF degrades under more aggressive compression: larger/denser source
+    files are harder content. Clips under ~160MB (30s @ native 4K) stayed
+    safely above threshold even pushed 5 CQ steps more aggressive than the
+    tier default (VMAF 89.1-89.4 vs an 85 threshold), while clips over
+    ~200MB were already at the edge at that same push (VMAF 85.1-85.9).
+    Matters most exactly when the search can't refine at all -- a real
+    batch was observed completing zero probes under contention, meaning
+    this fallback value is what actually gets used, not just a starting
+    point for exploration.
+
+    Deliberately narrow: only applies where it's been measured (AV1, the
+    Low tier, native 4K). No data yet for other codecs, tiers, or
+    resolutions, so it makes no adjustment there rather than extrapolate.
+    """
+    if not codec or codec.upper() != "AV1":
+        return 0
+    if vmaf_threshold is None or vmaf_threshold >= 89:
+        return 0
+    if not resolution or resolution[0] * resolution[1] < 3840 * 2160 * 0.9:
+        return 0
+    if original_size / 1_000_000 < 160:
+        return 5
+    return 0
+
+
 async def _probe_segment_duration_seconds(path: str, task_label: str) -> float:
     duration = await _probe_duration_seconds(path, task_label)
     if duration is None:
@@ -434,6 +750,8 @@ def _build_ffmpeg_args(
         explicit_cq=req.cq,
         compression_type=req.compression_type,
         vmaf_threshold=req.vmaf_threshold,
+        codec=req.codec,
+        encoder_mode=req.encoder_mode,
     )
     ffmpeg_args = [
         FFMPEG_BIN,
@@ -458,6 +776,33 @@ def _build_ffmpeg_args(
         # encoder effort. Default to a slower/higher-quality preset instead
         # of the CRF-tuned default, unless the caller overrode it.
         preset = str(SVT_AV1_PRESET) if is_svt else ("p6" if req.preset == "p4" else req.preset)
+        # NVENC advanced rate-control flags. VBR mode has no CQ to tune (the
+        # bitrate is fixed by the validator's request), so encoder effort is
+        # the only real lever -- A/B tested via explicit per-request
+        # overrides against 3 real HEVC/threshold-89 clips at their real
+        # 8Mbps target, scored with the production formula (full-video VMAF,
+        # not the noisy random-10-frame sample the real scoring fallback
+        # uses, so relative ranking between combos is trustworthy even
+        # though absolute VMAF differs from that path). Plain preset p7 gave
+        # essentially nothing over p6 (mean score 0.1841 vs 0.1838) despite
+        # costing ~12% more encode time. Adding multipass + lookahead +
+        # spatial/temporal AQ on top of p6 did help (mean 0.1886, no
+        # regression on any tested clip): +0.016 score on the one clip with
+        # real bitrate headroom to use it. Two of three clips were
+        # genuinely bitrate-starved at 8Mbps regardless of settings (VMAF
+        # 83-85, structurally below threshold) -- these flags help on the
+        # margin, they can't rescue a bitrate too low for the content.
+        if not is_svt:
+            multipass = req.nvenc_multipass or "fullres"
+            rc_lookahead = req.nvenc_rc_lookahead if req.nvenc_rc_lookahead is not None else 32
+            spatial_aq = req.nvenc_spatial_aq if req.nvenc_spatial_aq is not None else True
+            temporal_aq = req.nvenc_temporal_aq if req.nvenc_temporal_aq is not None else True
+            aq_strength = req.nvenc_aq_strength if req.nvenc_aq_strength is not None else 8
+            ffmpeg_args.extend(["-multipass", multipass])
+            ffmpeg_args.extend(["-rc-lookahead", str(rc_lookahead)])
+            ffmpeg_args.extend(["-spatial-aq", "1" if spatial_aq else "0"])
+            ffmpeg_args.extend(["-temporal-aq", "1" if temporal_aq else "0"])
+            ffmpeg_args.extend(["-aq-strength", str(aq_strength)])
     else:
         # SVT-AV1 uses -crf (0-63, same direction as NVENC's -cq: lower =
         # higher quality) instead of NVENC's -cq flag.
@@ -485,9 +830,21 @@ _VMAF_SCORE_RE = re.compile(r"VMAF score:\s*([\d.]+)")
 
 
 async def _measure_vmaf(
-    reference_path: str, distorted_path: str, task_label: str
+    reference_path: str,
+    distorted_path: str,
+    task_label: str,
+    n_subsample: int = 1,
+    timeout: float = CQ_SEARCH_PROBE_TIMEOUT_SECONDS,
 ) -> float | None:
-    """Real VMAF of distorted_path against reference_path, or None on failure."""
+    """Real VMAF of distorted_path against reference_path, or None on failure.
+
+    n_subsample > 1 scores every Nth frame instead of every frame -- only
+    safe to use for search-time probes (see _vmaf_subsample_for_resolution),
+    never for a value that gets returned or scored as final.
+    """
+    model = f"model=path={VMAF_MODEL_PATH}"
+    if n_subsample > 1:
+        model += f":n_subsample={n_subsample}"
     cmd = [
         FFMPEG_BIN,
         "-hide_banner",
@@ -497,13 +854,13 @@ async def _measure_vmaf(
         "-i",
         reference_path,
         "-lavfi",
-        f"[0:v][1:v]libvmaf=model=path={VMAF_MODEL_PATH}:n_threads={VMAF_N_THREADS}",
+        f"[0:v][1:v]libvmaf={model}:n_threads={VMAF_N_THREADS}",
         "-f",
         "null",
         "-",
     ]
     returncode, stdout, stderr, run_error = await _run_process(
-        cmd, task_label, "vmaf probe", timeout=CQ_SEARCH_PROBE_TIMEOUT_SECONDS
+        cmd, task_label, "vmaf probe", timeout=timeout
     )
     if returncode != 0 or run_error:
         return None
@@ -518,12 +875,13 @@ async def _encode_cq_probe(
     encoder: str,
     task_label: str,
     tmp_dir: str,
+    timeout: float = CQ_SEARCH_PROBE_TIMEOUT_SECONDS,
 ) -> str | None:
     probe_path = os.path.join(tmp_dir, f"probe_cq{cq}.mp4")
     probe_req = req.model_copy(update={"cq": cq})
     cmd = _build_ffmpeg_args(local_input, probe_path, probe_req, encoder)
     returncode, stdout, stderr, run_error = await _run_process(
-        cmd, task_label, f"cq probe cq={cq}", timeout=CQ_SEARCH_PROBE_TIMEOUT_SECONDS
+        cmd, task_label, f"cq probe cq={cq}", timeout=timeout
     )
     if returncode != 0 or run_error or not os.path.exists(probe_path):
         return None
@@ -574,17 +932,26 @@ async def _search_cq_for_max_score(
     req: "CompressRequest",
     encoder: str,
     task_label: str,
+    deadline: float | None = None,
 ) -> int:
     """Local search over AV1 CQ that directly maximizes the real compression
     score (probe-encode, measure real size + VMAF, score it), instead of
     trusting a fixed per-band guess. Starts near the static table's value and
     does coordinate-ascent with a shrinking step. Falls back to the static
     table on any probe failure, timeout, or if nothing scores above zero.
+
+    ``deadline`` is an absolute time.monotonic() value for the overall
+    request (see COMPRESSION_OVERALL_DEADLINE_SECONDS); the search stops
+    early against whichever of CQ_SEARCH_MAX_SECONDS or the remaining
+    request budget is tighter, so a slow queue wait doesn't leave the final
+    encode without enough time to finish before the validator's own timeout.
     """
     fallback_cq = resolve_compression_cq(
         explicit_cq=None,
         compression_type=req.compression_type,
         vmaf_threshold=req.vmaf_threshold,
+        codec=req.codec,
+        encoder_mode=req.encoder_mode,
     )
     if not CQ_SEARCH_ENABLED or req.vmaf_threshold is None:
         return fallback_cq
@@ -596,49 +963,178 @@ async def _search_cq_for_max_score(
     if original_size <= 0:
         return fallback_cq
 
+    resolution = await _probe_resolution(local_input, task_label)
+    size_bonus = _size_based_cq_bonus(req.vmaf_threshold, req.codec, resolution, original_size)
+    if size_bonus:
+        adjusted_fallback_cq = min(max(fallback_cq + size_bonus, CQ_SEARCH_MIN), CQ_SEARCH_MAX)
+        log.info(
+            f"[{task_label}] {original_size / 1_000_000:.1f}MB reference, size-based "
+            f"cq bonus +{size_bonus} (fallback {fallback_cq} -> {adjusted_fallback_cq})"
+        )
+        fallback_cq = adjusted_fallback_cq
+
+    start = time.monotonic()
+    max_seconds = req.search_max_seconds or CQ_SEARCH_MAX_SECONDS
+    if deadline is not None:
+        max_seconds = min(max_seconds, deadline - start)
+    if max_seconds <= 0:
+        log.warning(
+            f"[{task_label}] no time budget left for cq search, using fallback cq={fallback_cq}"
+        )
+        return fallback_cq
+
+    n_subsample = req.vmaf_n_subsample or (
+        _vmaf_subsample_for_resolution(*resolution, available_seconds=max_seconds)
+        if resolution
+        else 1
+    )
+    search_vmaf_margin = (
+        CQ_SEARCH_VMAF_MARGIN_BASE + CQ_SEARCH_VMAF_MARGIN_PER_SUBSAMPLE * n_subsample
+    )
+    search_threshold = req.vmaf_threshold + search_vmaf_margin
+    if n_subsample > 1:
+        log.info(
+            f"[{task_label}] {resolution[0]}x{resolution[1]} input, using "
+            f"VMAF n_subsample={n_subsample} for search probes "
+            f"(target={search_threshold:.2f}, margin={search_vmaf_margin:.2f}, "
+            f"budget={max_seconds:.1f}s)"
+        )
+
     tmp_dir = os.path.join(SHARED_VOLUME_PATH, f"{task_label}_cqsearch")
     os.makedirs(tmp_dir, exist_ok=True)
-    start = time.monotonic()
     tried: dict[int, float] = {}
+    probed_vmaf: dict[int, float] = {}
+    # Under heavy concurrent load a single probe (encode + VMAF) has been
+    # observed taking 45-60s -- attempting a second one with too little of
+    # the budget left doesn't fail fast, it fails *slow* (runs right up to
+    # its shrinking timeout for zero information gained), which just burns
+    # time that would otherwise go to the final encode or simply finishing
+    # sooner. Track how long completed attempts actually took and skip
+    # starting another once the remaining budget can't plausibly cover one.
+    probe_durations: list[float] = []
+
+    def _time_for_another_probe() -> bool:
+        remaining = max_seconds - (time.monotonic() - start)
+        if remaining <= 2:
+            return False
+        if probe_durations:
+            expected = sum(probe_durations) / len(probe_durations)
+            if remaining < expected * 0.8:
+                return False
+        return True
 
     async def probe_score(cq: int) -> None:
-        if cq in tried or time.monotonic() - start > CQ_SEARCH_MAX_SECONDS:
+        if cq in tried:
             return
-        probe_path = await _encode_cq_probe(
-            local_input, cq, req, encoder, task_label, tmp_dir
-        )
-        if probe_path is None:
-            tried[cq] = 0.0
-            return
+        remaining = max_seconds - (time.monotonic() - start)
+        attempt_start = time.monotonic()
         try:
-            compressed_size = os.path.getsize(probe_path)
-            vmaf = await _measure_vmaf(local_input, probe_path, task_label)
+            probe_path = await _encode_cq_probe(
+                local_input, cq, req, encoder, task_label, tmp_dir, timeout=remaining
+            )
+            if probe_path is None:
+                tried[cq] = 0.0
+                return
+            try:
+                compressed_size = os.path.getsize(probe_path)
+                remaining = max_seconds - (time.monotonic() - start)
+                if remaining <= 2:
+                    tried[cq] = 0.0
+                    return
+                vmaf = await _measure_vmaf(
+                    local_input,
+                    probe_path,
+                    task_label,
+                    n_subsample=n_subsample,
+                    timeout=remaining,
+                )
+            finally:
+                _cleanup(probe_path)
+            if vmaf is None:
+                tried[cq] = 0.0
+                return
+            s = _estimate_compression_score(
+                original_size, compressed_size, vmaf, search_threshold
+            )
+            tried[cq] = s
+            probed_vmaf[cq] = vmaf
+            log.info(
+                f"[{task_label}] cq search probe cq={cq} vmaf={vmaf:.2f} "
+                f"score_est={s:.4f}"
+            )
+            _log_cq_search_sample(
+                task_label=task_label,
+                codec=req.codec,
+                encoder_mode=req.encoder_mode,
+                compression_type=req.compression_type,
+                vmaf_threshold=req.vmaf_threshold,
+                resolution=resolution,
+                n_subsample=n_subsample,
+                cq=cq,
+                vmaf=vmaf,
+                score_est=s,
+                original_size=original_size,
+                compressed_size=compressed_size,
+            )
         finally:
-            _cleanup(probe_path)
-        if vmaf is None:
-            tried[cq] = 0.0
-            return
-        s = _estimate_compression_score(
-            original_size, compressed_size, vmaf, req.vmaf_threshold
-        )
-        tried[cq] = s
-        log.info(
-            f"[{task_label}] cq search probe cq={cq} vmaf={vmaf:.2f} "
-            f"score_est={s:.4f}"
-        )
+            probe_durations.append(time.monotonic() - attempt_start)
 
     try:
         center = min(max(fallback_cq, CQ_SEARCH_MIN), CQ_SEARCH_MAX)
-        step = 6
-        for cq in {
-            max(CQ_SEARCH_MIN, center - step),
-            center,
-            min(CQ_SEARCH_MAX, center + step),
-        }:
-            await probe_score(cq)
+        step = 3
+        # Under heavy concurrent load, probe_score's shrinking per-call
+        # timeout means often only one of these initial probes actually
+        # completes before the deadline (observed in production: a step of
+        # 6 landed the sole surviving probe on center+6, which hard-failed,
+        # wasting the whole budget and forcing fallback to the untouched
+        # static cq every time). Use a smaller step so a single probe is
+        # less likely to overshoot into hard-fail territory.
+        # center is not just a fallback guess -- a systematic calibration
+        # sweep (explicit cq bypassing search, real score via the production
+        # formula, real captured clips) put it at or near the true optimum
+        # at every tier tested this session. So center always goes first,
+        # guaranteeing a real score even if only one probe fits in the time
+        # budget.
+        #
+        # Past that, this replaces the old blind +/-3 neighbor-probe
+        # coordinate-ascent with slope-informed jumps that aim directly at
+        # search_threshold instead of hoping a fixed step happens to land
+        # close. A pooled analysis of every real (cq, vmaf) pair collected
+        # this session across both codecs put the empirical dVMAF/dcq slope
+        # at a consistent -1.7 (n=48, range -0.44 to -2.68) -- steep enough
+        # that blind +/-3 steps routinely overshoot past the hard-cutoff
+        # (exactly what several real calibration runs this session showed:
+        # a clip safely above threshold at one cq scoring zero just 2-3 cq
+        # later). Use that as the first jump's slope prior, then refine with
+        # the *actual* measured local slope for this specific clip on the
+        # second jump -- real content varies 6x in how steep this curve is,
+        # so the clip's own two data points beat any fixed prior. Whatever
+        # time budget remains after these targeted jumps still falls through
+        # to the coordinate-ascent loop below for further refinement.
+        await probe_score(center)
+        if center in probed_vmaf and _time_for_another_probe():
+            vmaf0 = probed_vmaf[center]
+            delta = (vmaf0 - search_threshold) / CQ_SEARCH_SLOPE_PRIOR
+            jump1 = min(CQ_SEARCH_MAX, max(CQ_SEARCH_MIN, round(center + delta)))
+            if jump1 == center:
+                jump1 = min(CQ_SEARCH_MAX, max(CQ_SEARCH_MIN,
+                    center + (1 if vmaf0 > search_threshold else -1)))
+            await probe_score(jump1)
+            if (
+                jump1 in probed_vmaf
+                and jump1 != center
+                and _time_for_another_probe()
+            ):
+                vmaf1 = probed_vmaf[jump1]
+                slope_actual = (vmaf1 - vmaf0) / (jump1 - center)
+                if slope_actual < -0.1:
+                    delta2 = (vmaf1 - search_threshold) / (-slope_actual)
+                    jump2 = min(CQ_SEARCH_MAX, max(CQ_SEARCH_MIN, round(jump1 + delta2)))
+                    if jump2 not in tried:
+                        await probe_score(jump2)
 
         while len(tried) < CQ_SEARCH_MAX_ITERS:
-            if not tried or time.monotonic() - start > CQ_SEARCH_MAX_SECONDS:
+            if not tried or not _time_for_another_probe():
                 break
             best_cq = max(tried, key=tried.get)
             neighbors = [
@@ -658,6 +1154,8 @@ async def _search_cq_for_max_score(
                 if not neighbors:
                     break
             for c in neighbors:
+                if not _time_for_another_probe():
+                    break
                 await probe_score(c)
             step = max(1, step // 2)
     finally:
@@ -921,7 +1419,12 @@ async def _cleanup_shared_volume_once():
     total_bytes = 0
     candidates: list[tuple[float, str, int]] = []
 
-    for root, _, files in os.walk(SHARED_VOLUME_PATH):
+    for root, dirs, files in os.walk(SHARED_VOLUME_PATH):
+        # PERSISTENT_DATA_DIR holds long-lived data (e.g. the CQ search
+        # log) that this TTL/quota sweep must never treat as scratch --
+        # pruning it from os.walk's traversal (not just skipping matched
+        # files) also protects anything nested inside it in the future.
+        dirs[:] = [d for d in dirs if os.path.join(root, d) != PERSISTENT_DATA_DIR]
         for filename in files:
             path = os.path.abspath(os.path.join(root, filename))
             try:
@@ -1115,6 +1618,21 @@ class CompressRequest(BaseModel):
     target_bitrate: Optional[int] = Field(
         None, description="Target bitrate in bps (for VBR mode)"
     )
+    nvenc_multipass: Optional[str] = Field(
+        None, description="Per-request NVENC -multipass override (e.g. 'fullres', 'qres'). VBR-mode experiment only."
+    )
+    nvenc_rc_lookahead: Optional[int] = Field(
+        None, description="Per-request NVENC -rc-lookahead override (frames). VBR-mode experiment only."
+    )
+    nvenc_spatial_aq: Optional[bool] = Field(
+        None, description="Per-request NVENC -spatial-aq override. VBR-mode experiment only."
+    )
+    nvenc_temporal_aq: Optional[bool] = Field(
+        None, description="Per-request NVENC -temporal-aq override. VBR-mode experiment only."
+    )
+    nvenc_aq_strength: Optional[int] = Field(
+        None, description="Per-request NVENC -aq-strength override (1-15). VBR-mode experiment only."
+    )
     target_width: Optional[int] = Field(
         None, description="Target width for downscaling"
     )
@@ -1135,6 +1653,39 @@ class CompressRequest(BaseModel):
         ge=0,
         le=100,
         description="Competition quality floor communicated to customized solutions",
+    )
+    encoder_mode: Optional[str] = Field(
+        None,
+        description="Per-request override of AV1_ENCODER_MODE ('nvenc' or 'svt'). "
+        "Only the organic job/poll path (minutes-scale budget, not scored "
+        "synthetic traffic) should ever set this to 'svt' -- slow SVT-AV1 is "
+        "more bit-efficient than NVENC but 10-15x slower.",
+    )
+    deadline_seconds: Optional[float] = Field(
+        None,
+        gt=0,
+        description="Per-request override of COMPRESSION_OVERALL_DEADLINE_SECONDS, "
+        "for callers with a longer budget than the default synchronous path.",
+    )
+    search_max_seconds: Optional[float] = Field(
+        None,
+        gt=0,
+        description="Per-request override of CQ_SEARCH_MAX_SECONDS. Needed alongside "
+        "deadline_seconds for slow encoders (e.g. SVT-AV1 at a real quality preset) "
+        "where a single probe can itself exceed the default 90s search cap, which "
+        "would otherwise silently disable the search regardless of how generous "
+        "deadline_seconds is.",
+    )
+    vmaf_n_subsample: Optional[int] = Field(
+        None,
+        ge=1,
+        description="Per-request override of the resolution-based VMAF n_subsample "
+        "search probes normally use. n_subsample>1 trades measurement accuracy for "
+        "speed under the tight synchronous budget; with a generous deadline (e.g. "
+        "the organic job path) forcing 1 gets an accurate signal instead of a noisy "
+        "one, and the safety margin (which scales with n_subsample) shrinks to match "
+        "automatically -- so the search can tell 'really passes' from 'really fails' "
+        "instead of everything looking like a marginal soft-zone case.",
     )
 
     @model_validator(mode="after")
@@ -1237,14 +1788,19 @@ async def _compress_one(
     *,
     requested_output_path: str | None = None,
 ) -> CompressResponse:
+    item_start = time.monotonic()
+    overall_deadline = item_start + (req.deadline_seconds or COMPRESSION_OVERALL_DEADLINE_SECONDS)
     remote_mode = _is_url(input_video)
     encoder = CODEC_MAP.get(req.codec.upper(), "av1_nvenc")
-    if req.codec.upper() == "AV1" and AV1_ENCODER_MODE == "svt":
+    effective_av1_mode = req.encoder_mode or AV1_ENCODER_MODE
+    if req.codec.upper() == "AV1" and effective_av1_mode == "svt":
         encoder = "libsvtav1"
     resolved_cq = resolve_compression_cq(
         explicit_cq=req.cq,
         compression_type=req.compression_type,
         vmaf_threshold=req.vmaf_threshold,
+        codec=req.codec,
+        encoder_mode=effective_av1_mode,
     )
 
     if remote_mode and DISABLE_REMOTE_IO:
@@ -1314,7 +1870,11 @@ async def _compress_one(
                 )
             ):
                 searched_cq = await _search_cq_for_max_score(
-                    local_input, req, encoder, task_label
+                    local_input,
+                    req,
+                    encoder,
+                    task_label,
+                    deadline=overall_deadline - COMPRESSION_FINAL_ENCODE_RESERVE_SECONDS,
                 )
                 log.info(f"[{task_label}] adaptive cq search selected cq={searched_cq}")
                 req.cq = searched_cq
@@ -1344,6 +1904,7 @@ async def _compress_one(
                                 cmd,
                                 task_label,
                                 "single-pass compression fallback",
+                                timeout=max(15.0, overall_deadline - time.monotonic()),
                             )
                         else:
                             run_error = str(e)
@@ -1356,6 +1917,7 @@ async def _compress_one(
                         cmd,
                         task_label,
                         "single-pass compression",
+                        timeout=max(15.0, overall_deadline - time.monotonic()),
                     )
 
         snapshot = await _queue_snapshot()

@@ -1,6 +1,8 @@
 import asyncio
+import json
 import os
 import posixpath
+import shutil
 import threading
 import time
 import traceback
@@ -8,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Tuple
+from urllib.parse import urlparse
 
 import boto3
 import httpx
@@ -43,7 +46,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(REPO_ROOT / "miner" / ".env", override=False)
 
 MAX_CONTENT_LEN = ContentLength.FIVE
-warrant_task = TaskType.UPSCALING
+# Stock default was TaskType.UPSCALING -- left unedited, this told every
+# TaskWarrantRequest (including from validator UID 0) that this miner serves
+# upscaling, even though only the compression service is configured and
+# running. That's why zero VideoCompressionProtocol queries ever arrived:
+# the validator correctly classified this UID into the upscaling pool based
+# on our own self-reported answer. Confirmed via 10 real TaskWarrantRequest
+# log entries, all answered with UPSCALING before this fix.
+warrant_task = TaskType.COMPRESSION
 DEV_MODE = os.getenv("DEV_MODE", "False").lower() == "true"
 
 
@@ -79,11 +89,54 @@ DEFAULT_COMPRESSION_TIMEOUT_SECONDS = os.getenv(
 COMPRESSION_SERVICE_TIMEOUT_SECONDS = float(
     os.getenv("MINER_COMPRESSION_SERVICE_TIMEOUT_SECONDS", DEFAULT_COMPRESSION_TIMEOUT_SECONDS)
 )
+# The validator's synchronous compression call has a hard 180s timeout
+# (call_miner_batch). The compression service's own internal deadline used
+# to be a flat, static guess (COMPRESSION_OVERALL_DEADLINE_SECONDS) applied
+# fresh to every request regardless of how much of that 180s the download
+# already consumed -- confirmed in real traffic to blow the deadline when a
+# slow download (observed up to ~103s) stacks with a full fresh internal
+# budget (~90s): 3 of 5 batches checked in one session breached 180s this
+# way (up to 196.89s). Fix: compute the *actual* remaining budget from when
+# the request was received and pass it as a per-request deadline_seconds
+# override, so a slow download correctly shrinks the time left for search +
+# encode instead of the compression service being blind to it.
+VALIDATOR_COMPRESSION_DEADLINE_SECONDS = float(
+    os.getenv("MINER_VALIDATOR_COMPRESSION_DEADLINE_SECONDS", "180")
+)
+COMPRESSION_RESPONSE_SAFETY_MARGIN_SECONDS = float(
+    os.getenv("MINER_COMPRESSION_RESPONSE_SAFETY_MARGIN_SECONDS", "15")
+)
+# Organic compression jobs run through the validator's job/poll path (up to
+# a 20-minute poll budget), not the 180s synchronous synthetic path -- this
+# needs to comfortably outlast the compression service's own internal
+# deadline_seconds (see _compression_service_payload's high_quality branch)
+# so our own HTTP client isn't what cuts the job short.
+COMPRESSION_JOB_SERVICE_TIMEOUT_SECONDS = float(
+    os.getenv("MINER_COMPRESSION_JOB_SERVICE_TIMEOUT_SECONDS", "960")
+)
 MODAL_APP_NAME = os.getenv("MODAL_APP_NAME", "vidaio-miner-workers").strip()
 MODAL_UPSCALING_FUNCTION = os.getenv("MINER_MODAL_UPSCALING_FUNCTION", "upscale_video2x").strip()
 MODAL_COMPRESSION_FUNCTION = os.getenv("MINER_MODAL_COMPRESSION_FUNCTION", "compress").strip()
 MINER_DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("MINER_DOWNLOAD_TIMEOUT_SECONDS", "600"))
 MINER_UPLOAD_URL_EXPIRY_SECONDS = int(os.getenv("MINER_STORAGE_S3_PRESIGNED_EXPIRY", os.getenv("S3_PRESIGNED_EXPIRY", "3600")))
+
+# Local CQ-curve tuning needs real reference clips, and synthetic test
+# patterns have repeatedly proven unreliable for that (same-CQ probes land
+# wildly different VMAF/bitrate than real content). Best-effort copy each
+# real validator reference clip we already download, before it's cleaned
+# up, into a small rolling local library so encoder behavior can be tested
+# offline against actual production content instead of guesses. Never
+# allowed to affect or block real task processing -- failures are logged
+# and swallowed, never raised.
+REAL_CONTENT_LIBRARY_ENABLED = os.getenv(
+    "MINER_REAL_CONTENT_LIBRARY_ENABLED", "true"
+).lower() in ("1", "true", "yes")
+REAL_CONTENT_LIBRARY_PATH = Path(
+    os.getenv("MINER_REAL_CONTENT_LIBRARY_PATH", "/root/vidaio-real-content-library")
+).expanduser()
+REAL_CONTENT_LIBRARY_MAX_FILES = int(
+    os.getenv("MINER_REAL_CONTENT_LIBRARY_MAX_FILES", "80")
+)
 
 HOST_SHARED_VOLUME_PATH = Path(
     os.getenv("MINER_SHARED_VOLUME_PATH")
@@ -496,8 +549,12 @@ class Miner(BaseMiner):
         host_path = HOST_SHARED_VOLUME_PATH / f"{task_id}_input.mp4"
         self._track_shared_file(host_path)
 
-        logger.info(f"Downloading validator payload to shared volume: {host_path}")
+        source_host = urlparse(video_url).netloc
+        logger.info(
+            f"Downloading validator payload to shared volume: {host_path} (source: {source_host})"
+        )
         timeout = httpx.Timeout(MINER_DOWNLOAD_TIMEOUT_SECONDS)
+        dl_start = time.time()
         try:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
                 async with client.stream("GET", video_url) as response:
@@ -505,12 +562,49 @@ class Miner(BaseMiner):
                     with open(host_path, "wb") as file:
                         async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
                             file.write(chunk)
+            dl_elapsed = time.time() - dl_start
+            size_bytes = host_path.stat().st_size
+            mbps = (size_bytes * 8 / 1_000_000) / dl_elapsed if dl_elapsed > 0 else 0.0
+            logger.info(
+                f"Download complete: {task_id} from {source_host} -- "
+                f"{size_bytes / 1_000_000:.1f} MB in {dl_elapsed:.1f}s ({mbps:.1f} Mbps)"
+            )
         except Exception:
             self._cleanup_shared_files(host_path)
             self._untrack_shared_file(host_path)
             raise
 
         return host_path, self._container_shared_path(host_path)
+
+    async def _capture_reference_sample(self, host_path: Path, payload, task_id: str) -> None:
+        if not REAL_CONTENT_LIBRARY_ENABLED:
+            return
+        try:
+            REAL_CONTENT_LIBRARY_PATH.mkdir(parents=True, exist_ok=True)
+            codec = str(getattr(payload, "target_codec", "unknown"))
+            threshold = getattr(payload, "vmaf_threshold", "unknown")
+            dest_name = f"{task_id}_{codec}_thr{threshold}.mp4"
+            dest_path = REAL_CONTENT_LIBRARY_PATH / dest_name
+            await asyncio.to_thread(shutil.copy2, host_path, dest_path)
+            meta = {
+                "task_id": task_id,
+                "codec": codec,
+                "codec_mode": getattr(payload, "codec_mode", None),
+                "vmaf_threshold": threshold,
+                "target_bitrate": getattr(payload, "target_bitrate", None),
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+            }
+            Path(f"{dest_path}.json").write_text(json.dumps(meta))
+
+            samples = sorted(
+                REAL_CONTENT_LIBRARY_PATH.glob("*.mp4"), key=lambda p: p.stat().st_mtime
+            )
+            while len(samples) > REAL_CONTENT_LIBRARY_MAX_FILES:
+                oldest = samples.pop(0)
+                oldest.unlink(missing_ok=True)
+                Path(f"{oldest}.json").unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"Failed to capture real content sample for {task_id}: {e}")
 
     def _get_s3_client(self):
         client_kwargs = {
@@ -581,7 +675,14 @@ class Miner(BaseMiner):
             return compression_type
         return None
 
-    def _compression_service_payload(self, payload, video_path: str, task_id: str) -> dict:
+    def _compression_service_payload(
+        self,
+        payload,
+        video_path: str,
+        task_id: str,
+        high_quality: bool = False,
+        request_start: float | None = None,
+    ) -> dict:
         compression_type = self._compression_type_from_payload(payload)
         compression_config = {
             "video_paths": [video_path],
@@ -594,6 +695,42 @@ class Miner(BaseMiner):
 
         if compression_type is not None:
             compression_config["compression_type"] = compression_type
+
+        if high_quality:
+            # Organic jobs get a ~20-minute poll budget from the validator
+            # (call_miner_polling: 20 polls * 60s), vastly more than the
+            # 180s synchronous synthetic path this service is normally
+            # tuned for. Slow SVT-AV1 measured a real, validated efficiency
+            # win over NVENC on real hard content (smaller file *and*
+            # higher VMAF at the same bitrate) but takes ~10-15x longer --
+            # affordable here, not on the synthetic path. This never
+            # touches synthetic scoring: it's a separate code path only
+            # organic jobs opt into.
+            compression_config["encoder_mode"] = "svt"
+            compression_config["deadline_seconds"] = 900.0
+            # A single slow-preset SVT-AV1 probe can itself run 77-150s+ (measured),
+            # far past the default 90s search cap -- give the search real room to
+            # explore while still reserving several hundred seconds of the 900s
+            # budget for the final encode.
+            compression_config["search_max_seconds"] = 400.0
+            # Full-precision VMAF instead of the resolution-based subsample the
+            # tight synchronous budget needs -- with this much time to spend, an
+            # accurate signal is affordable, and the safety margin (which scales
+            # with n_subsample) shrinks to match automatically.
+            compression_config["vmaf_n_subsample"] = 1
+        elif request_start is not None:
+            # Synchronous/synthetic path: replace the static deadline guess
+            # with the real remaining budget against the validator's 180s
+            # wall, measured from when this request actually arrived --
+            # download time (or anything else that happened first) is no
+            # longer invisible to the compression service's own deadline.
+            elapsed = time.time() - request_start
+            remaining = (
+                VALIDATOR_COMPRESSION_DEADLINE_SECONDS
+                - elapsed
+                - COMPRESSION_RESPONSE_SAFETY_MARGIN_SECONDS
+            )
+            compression_config["deadline_seconds"] = max(5.0, remaining)
 
         return compression_config
 
@@ -773,14 +910,27 @@ class Miner(BaseMiner):
             ]
         )
 
-    async def _forward_compression_url_to_service(self, payload, payload_url: str) -> str | None:
+    async def _forward_compression_url_to_service(
+        self,
+        payload,
+        payload_url: str,
+        high_quality: bool = False,
+        request_start: float | None = None,
+    ) -> str | None:
         task_id = uuid.uuid4().hex[:12]
+        service_timeout = (
+            COMPRESSION_JOB_SERVICE_TIMEOUT_SECONDS
+            if high_quality
+            else COMPRESSION_SERVICE_TIMEOUT_SECONDS
+        )
         if PROCESSING_BACKEND == "modal":
             return await self._call_modal_processing_function(
                 "compression",
                 MODAL_COMPRESSION_FUNCTION,
-                self._compression_service_payload(payload, payload_url, task_id),
-                COMPRESSION_SERVICE_TIMEOUT_SECONDS,
+                self._compression_service_payload(
+                    payload, payload_url, task_id, high_quality, request_start
+                ),
+                service_timeout,
             )
 
         input_host_path = None
@@ -789,12 +939,15 @@ class Miner(BaseMiner):
             input_host_path, input_container_path = await self._download_to_shared_volume(
                 payload_url, task_id
             )
+            asyncio.create_task(self._capture_reference_sample(input_host_path, payload, task_id))
             processed_ref = await self._post_processing_service(
                 "compression",
                 COMPRESSION_SERVICE_URL,
                 "/compress",
-                self._compression_service_payload(payload, input_container_path, task_id),
-                COMPRESSION_SERVICE_TIMEOUT_SECONDS,
+                self._compression_service_payload(
+                    payload, input_container_path, task_id, high_quality, request_start
+                ),
+                service_timeout,
             )
             if processed_ref is None:
                 return None
@@ -807,7 +960,9 @@ class Miner(BaseMiner):
         finally:
             self._cleanup_shared_files(input_host_path, output_host_path)
 
-    async def _forward_compression_payload_to_service(self, payload) -> list[str]:
+    async def _forward_compression_payload_to_service(
+        self, payload, high_quality: bool = False, request_start: float | None = None
+    ) -> list[str]:
         urls = self._payload_reference_video_urls(payload)
         if not urls:
             logger.error(f"Compression payload missing reference video URLs: {self._payload_debug_dump(payload)}")
@@ -816,7 +971,9 @@ class Miner(BaseMiner):
         async def _process_one(index: int, payload_url: str) -> str:
             try:
                 item_payload = self._compression_payload_for_index(payload, index)
-                processed_url = await self._forward_compression_url_to_service(item_payload, payload_url)
+                processed_url = await self._forward_compression_url_to_service(
+                    item_payload, payload_url, high_quality, request_start
+                )
                 return processed_url or ""
             except Exception as e:
                 logger.error(f"Failed to process compression payload item {index}: {e}")
@@ -947,7 +1104,9 @@ class Miner(BaseMiner):
         check_version(synapse.version)
 
         try:
-            processed_video_urls = await self._forward_compression_payload_to_service(synapse.miner_payload)
+            processed_video_urls = await self._forward_compression_payload_to_service(
+                synapse.miner_payload, request_start=start_time
+            )
 
             if not any(processed_video_urls):
                 logger.info(f"💔 Failed to compress video 💔")
@@ -1014,7 +1173,9 @@ class Miner(BaseMiner):
                 return synapse
 
             async def _run_compression():
-                result = await self._forward_compression_payload_to_service(synapse.miner_payload)
+                result = await self._forward_compression_payload_to_service(
+                    synapse.miner_payload, high_quality=True
+                )
                 logger.info(f"CompressionJob processed successfully | job_id={job_id} | result={result}")
                 return result
 
