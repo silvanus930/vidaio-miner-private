@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import posixpath
+import re
 import shutil
 import threading
 import time
@@ -136,6 +137,16 @@ REAL_CONTENT_LIBRARY_PATH = Path(
 ).expanduser()
 REAL_CONTENT_LIBRARY_MAX_FILES = int(
     os.getenv("MINER_REAL_CONTENT_LIBRARY_MAX_FILES", "80")
+)
+# Plain FIFO eviction lost the only samples of rare (codec, threshold)
+# categories mid-calibration more than once in practice -- whatever combo
+# wasn't actively flowing got evicted by whatever was, even though a single
+# rare clip is worth far more for calibration than one more of an already
+# well-represented category. Reserve a minimum per category (needs >=2 to
+# ever compute a rate-distortion slope at all) and only evict from
+# categories already above their own reserve.
+REAL_CONTENT_LIBRARY_MIN_PER_CATEGORY = int(
+    os.getenv("MINER_REAL_CONTENT_LIBRARY_MIN_PER_CATEGORY", "3")
 )
 
 HOST_SHARED_VOLUME_PATH = Path(
@@ -600,11 +611,49 @@ class Miner(BaseMiner):
                 REAL_CONTENT_LIBRARY_PATH.glob("*.mp4"), key=lambda p: p.stat().st_mtime
             )
             while len(samples) > REAL_CONTENT_LIBRARY_MAX_FILES:
-                oldest = samples.pop(0)
-                oldest.unlink(missing_ok=True)
-                Path(f"{oldest}.json").unlink(missing_ok=True)
+                victim = self._pick_eviction_victim(samples)
+                if victim is None:
+                    # Every category is already at or below its reserve --
+                    # can't evict without breaking that guarantee. Only
+                    # reachable if distinct categories * reserve > cap (e.g.
+                    # >26 categories at reserve=3, cap=80), which isn't
+                    # expected in practice; fall back to plain oldest-first
+                    # rather than growing unbounded.
+                    victim = samples[0]
+                samples.remove(victim)
+                victim.unlink(missing_ok=True)
+                Path(f"{victim}.json").unlink(missing_ok=True)
         except Exception as e:
             logger.warning(f"Failed to capture real content sample for {task_id}: {e}")
+
+    @staticmethod
+    def _sample_category(mp4_path: Path) -> tuple[str, str]:
+        try:
+            meta = json.loads(Path(f"{mp4_path}.json").read_text())
+            return (str(meta.get("codec", "unknown")), str(meta.get("vmaf_threshold", "unknown")))
+        except Exception:
+            match = re.match(r".+_([a-zA-Z0-9]+)_thr([0-9.]+)\.mp4$", mp4_path.name)
+            if match:
+                return (match.group(1), match.group(2))
+            return ("unknown", "unknown")
+
+    @classmethod
+    def _pick_eviction_victim(cls, samples: list[Path]) -> Path | None:
+        counts: dict[tuple[str, str], int] = {}
+        for p in samples:
+            cat = cls._sample_category(p)
+            counts[cat] = counts.get(cat, 0) + 1
+        # Oldest sample belonging to whichever category is furthest above
+        # its own reserve, so the categories closest to their floor are
+        # protected first.
+        best: Path | None = None
+        best_surplus = 0
+        for p in samples:  # already sorted oldest-first
+            surplus = counts[cls._sample_category(p)] - REAL_CONTENT_LIBRARY_MIN_PER_CATEGORY
+            if surplus > best_surplus:
+                best = p
+                best_surplus = surplus
+        return best
 
     def _get_s3_client(self):
         client_kwargs = {
