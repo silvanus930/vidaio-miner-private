@@ -6,6 +6,7 @@ independent of the compression service and the miner -- see run_server.sh.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import calibration
@@ -13,11 +14,12 @@ import cq_health
 import db
 import library
 from auth import require_auth
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
 REFERENCE_LIBRARY_PATH = Path("/root/vidaio-real-content-library")
 COMPRESSED_LIBRARY_PATH = Path("/root/vidaio-compressed-sample-library")
+_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
 app = FastAPI(title="Vidaio Miner CMS")
 Auth = Depends(require_auth)
@@ -26,6 +28,50 @@ Auth = Depends(require_auth)
 def _find_sample(library_path: Path, task_id: str) -> Path | None:
     matches = list(library_path.glob(f"{task_id}_*.mp4"))
     return matches[0] if matches else None
+
+
+_STREAM_CHUNK = 1024 * 1024
+
+
+def _stream_video(path: Path, request: Request) -> StreamingResponse:
+    """Plain FileResponse ignores the Range header and always returns 200
+    with the entire file -- for a 200MB+ 4K reference clip, that means the
+    browser has to download the whole thing before it can play anything,
+    which looks exactly like the "spinning, never plays" symptom this was
+    built to fix. Real 206 Partial Content support so the <video> element
+    can seek and start playing immediately.
+    """
+    file_size = path.stat().st_size
+    range_header = request.headers.get("range")
+    start, end = 0, file_size - 1
+    status_code = 200
+    if range_header:
+        match = _RANGE_RE.match(range_header)
+        if match:
+            if match.group(1):
+                start = int(match.group(1))
+            if match.group(2):
+                end = int(match.group(2))
+            end = min(end, file_size - 1)
+            status_code = 206
+
+    def iterfile():
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = f.read(min(_STREAM_CHUNK, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    headers = {
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(end - start + 1),
+    }
+    return StreamingResponse(iterfile(), status_code=status_code, media_type="video/mp4", headers=headers)
 
 
 @app.on_event("startup")
@@ -52,6 +98,15 @@ def api_get_item(task_id: str, user: str = Auth):
     item = db.get_item(task_id)
     if item is None:
         raise HTTPException(status_code=404, detail="item not found")
+    # The DB's has_*_sample flags are set once at ingest time, but the
+    # compressed-sample capture is a fire-and-forget background task in a
+    # separate process (neurons/miner.py) with no ordering guarantee
+    # against the outcome-log write this row was ingested from -- ingest
+    # can easily run before the file finishes copying, permanently
+    # freezing the flag at False even though the file shows up moments
+    # later. Check the filesystem live instead of trusting that snapshot.
+    item["has_reference_sample"] = int(_find_sample(REFERENCE_LIBRARY_PATH, task_id) is not None)
+    item["has_compressed_sample"] = int(_find_sample(COMPRESSED_LIBRARY_PATH, task_id) is not None)
     return item
 
 
@@ -71,19 +126,19 @@ def api_rate_distortion(limit: int = 500, user: str = Auth):
 
 
 @app.get("/video/{task_id}/reference")
-def video_reference(task_id: str, user: str = Auth):
+def video_reference(task_id: str, request: Request, user: str = Auth):
     path = _find_sample(REFERENCE_LIBRARY_PATH, task_id)
     if path is None:
         raise HTTPException(status_code=404, detail="reference sample not retained for this item")
-    return FileResponse(path, media_type="video/mp4")
+    return _stream_video(path, request)
 
 
 @app.get("/video/{task_id}/compressed")
-def video_compressed(task_id: str, user: str = Auth):
+def video_compressed(task_id: str, request: Request, user: str = Auth):
     path = _find_sample(COMPRESSED_LIBRARY_PATH, task_id)
     if path is None:
         raise HTTPException(status_code=404, detail="compressed sample not retained for this item")
-    return FileResponse(path, media_type="video/mp4")
+    return _stream_video(path, request)
 
 
 # --- CQ table health ----------------------------------------------------
