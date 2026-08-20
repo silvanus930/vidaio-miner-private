@@ -11,6 +11,7 @@ import json
 import time
 from pathlib import Path
 
+import alerting
 import db
 
 OUTCOME_LOG_PATH = Path(
@@ -38,6 +39,7 @@ def ingest_once() -> int:
         offset = 0
 
     new_records = 0
+    ingested: list[dict] = []
     with open(OUTCOME_LOG_PATH, "r") as f:
         f.seek(offset)
         for line in f:
@@ -54,10 +56,13 @@ def ingest_once() -> int:
             has_ref = _sample_exists(REFERENCE_LIBRARY_PATH, task_id)
             has_comp = _sample_exists(COMPRESSED_LIBRARY_PATH, task_id)
             db.upsert_item(record, has_ref, has_comp)
+            ingested.append(db.get_item(task_id))
             new_records += 1
         new_offset = f.tell()
 
     db.set_ingest_offset(SOURCE_NAME, new_offset)
+    if ingested:
+        alerting.check_alerts(ingested)
     return new_records
 
 
@@ -69,6 +74,7 @@ def main() -> None:
             n = ingest_once()
             if n:
                 print(f"ingested {n} new item(s)", flush=True)
+            alerting.check_alerts([])  # cheap health-only pass every cycle
         except Exception as e:
             print(f"ingest error: {e}", flush=True)
         time.sleep(15)

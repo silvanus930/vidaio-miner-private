@@ -39,7 +39,7 @@ start_miner() {
       --subtensor.network finney --netuid 85 \
       --axon.ip 0.0.0.0 --axon.port "$LOCAL_PORT" \
       --axon.external_ip "$TUNNEL_HOST" --axon.external_port "$REMOTE_PORT" \
-      --logging.debug > "$MINER_LOG" 2>&1 &
+      --logging.debug >> "$MINER_LOG" 2>&1 &
     disown
   )
   log "miner (re)started, advertising $TUNNEL_HOST:$REMOTE_PORT"

@@ -1,0 +1,476 @@
+<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vidaio Miner CMS</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%236366f1'/%3E%3Cpath d='M9 11.5A2.5 2.5 0 0 1 11.5 9h6A2.5 2.5 0 0 1 20 11.5v9a2.5 2.5 0 0 1-2.5 2.5h-6A2.5 2.5 0 0 1 9 20.5v-9Z' fill='none' stroke='white' stroke-width='1.8'/%3E%3Cpath d='M20 13.8l4.2-2.4a.8.8 0 0 1 1.2.7v7.8a.8.8 0 0 1-1.2.7L20 18.2' fill='none' stroke='white' stroke-width='1.8' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0d12; --surface: #12151c; --surface-2: #171b24; --border: #232836;
+    --text: #e8eaf0; --text-dim: #8b93a7; --text-faint: #565f74;
+    --accent: #6366f1; --accent-soft: rgba(99, 102, 241, 0.14);
+    --good: #34d399; --good-soft: rgba(52, 211, 153, 0.14);
+    --warn: #fbbf24; --warn-soft: rgba(251, 191, 36, 0.14);
+    --crit: #f87171; --crit-soft: rgba(248, 113, 113, 0.14);
+    --radius: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    background: var(--bg); color: var(--text); margin: 0;
+    padding: 28px clamp(16px, 4vw, 48px) 60px; line-height: 1.5;
+  }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+  .logo {
+    width: 36px; height: 36px; border-radius: 9px;
+    background: linear-gradient(135deg, var(--accent), #818cf8);
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  .logo svg { width: 20px; height: 20px; }
+  h1 { font-size: 17px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  .subtitle { font-size: 12.5px; color: var(--text-dim); margin-top: 2px; }
+  nav { display: flex; gap: 4px; margin: 20px 0 24px; border-bottom: 1px solid var(--border); }
+  nav button {
+    background: none; border: none; color: var(--text-dim); font-size: 13px; font-weight: 600;
+    padding: 9px 14px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px;
+    font-family: inherit;
+  }
+  nav button.active { color: var(--text); border-bottom-color: var(--accent); }
+  nav button:hover { color: var(--text); }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  #alert-banner { margin-bottom: 20px; display: none; }
+  .alert-row {
+    display: flex; align-items: center; gap: 10px; padding: 9px 14px; border-radius: 8px;
+    font-size: 12.5px; margin-bottom: 6px; border: 1px solid var(--border);
+  }
+  .alert-row.critical { background: var(--crit-soft); border-color: rgba(248,113,113,0.3); }
+  .alert-row.warning { background: var(--warn-soft); border-color: rgba(251,191,36,0.3); }
+  .alert-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .alert-row.critical .alert-dot { background: var(--crit); }
+  .alert-row.warning .alert-dot { background: var(--warn); }
+  .alert-time { color: var(--text-faint); margin-left: auto; flex-shrink: 0; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; margin-bottom: 24px; }
+  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; font-size: 12.5px; color: var(--text-dim); }
+  .stat-card b { display: block; font-size: 22px; font-weight: 650; color: var(--text); letter-spacing: -0.02em; margin-bottom: 2px; }
+  .stat-card .cat { color: var(--accent); font-weight: 600; }
+  .stat-card.ok b { color: var(--good); }
+  .stat-card.warn b { color: var(--warn); }
+  .stat-card.crit b { color: var(--crit); }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+  @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; margin-bottom: 20px; }
+  .panel-head { padding: 14px 18px; border-bottom: 1px solid var(--border); font-size: 12.5px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em; display: flex; justify-content: space-between; align-items: center; }
+  .panel-head .hint { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--text-faint); }
+  .panel-body { padding: 16px 18px; }
+
+  select, input, button.btn {
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 7px; padding: 6px 10px; font-size: 12.5px; font-family: inherit;
+  }
+  button.btn { cursor: pointer; font-weight: 600; }
+  button.btn.primary { background: var(--accent); border-color: var(--accent); color: white; }
+  button.btn:hover { border-color: #3a4155; }
+  .controls { display: flex; gap: 8px; padding: 12px 18px; border-bottom: 1px solid var(--border); flex-wrap: wrap; align-items: center; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 10px 18px; }
+  th { color: var(--text-faint); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; }
+  th:hover { color: var(--text-dim); }
+  th.sorted { color: var(--accent); }
+  tbody tr { border-bottom: 1px solid var(--border); cursor: pointer; transition: background 0.1s; }
+  tbody tr:last-child { border-bottom: none; }
+  tbody tr:hover { background: var(--surface-2); }
+  td.task { color: var(--text-dim); font-family: ui-monospace, monospace; font-size: 12px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: #a5a8ff; font-size: 11px; font-weight: 600; }
+  .score-pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+  .score-pill.hi { background: var(--good-soft); color: var(--good); }
+  .score-pill.mid { background: var(--warn-soft); color: var(--warn); }
+  .score-pill.lo { background: var(--crit-soft); color: var(--crit); }
+  .empty { padding: 48px 18px; text-align: center; color: var(--text-faint); font-size: 13px; }
+
+  #detail { display: none; }
+  #detail .panel-head .task-id { font-family: ui-monospace, monospace; color: var(--text); font-size: 13px; font-weight: 600; text-transform: none; }
+  .detail-meta { font-size: 12.5px; color: var(--text-dim); display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+  .detail-meta span b { color: var(--text); font-weight: 600; }
+  .videos { display: flex; gap: 16px; flex-wrap: wrap; }
+  .video-card { flex: 1; min-width: 280px; max-width: 460px; }
+  .video-card video { width: 100%; background: #000; border-radius: 8px; display: block; border: 1px solid var(--border); }
+  .video-label { font-size: 11px; color: var(--text-faint); margin-top: 6px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+  .missing { color: var(--text-faint); font-style: italic; padding: 24px; text-align: center; font-size: 13px; }
+
+  .health-row td { padding: 9px 18px; }
+  .health-badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+  .health-badge.match { background: var(--good-soft); color: var(--good); }
+  .health-badge.gap { background: var(--warn-soft); color: var(--warn); }
+  .health-badge.none { background: var(--crit-soft); color: var(--crit); }
+
+  .thumb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+  .thumb-card { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface-2); }
+  .thumb-card img { width: 100%; aspect-ratio: 16/9; object-fit: cover; background: #000; display: block; }
+  .thumb-meta { padding: 6px 8px; font-size: 10.5px; color: var(--text-dim); }
+  .coverage-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-bottom: 16px; }
+  .coverage-cell { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 12px; }
+  .coverage-cell.thin { border-color: rgba(251,191,36,0.4); background: var(--warn-soft); }
+  .coverage-cell b { display: block; font-size: 18px; }
+
+  form.cal-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+  .run-row { padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+  .run-row:last-child { border-bottom: none; }
+  .run-status { font-weight: 700; }
+  .run-status.running { color: var(--warn); }
+  .run-status.done { color: var(--good); }
+  pre.log-tail { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 11px; color: var(--text-dim); max-height: 160px; overflow: auto; margin-top: 6px; }
+
+  svg.chart { width: 100%; height: 220px; display: block; }
+  .chart-tooltip-hint { font-size: 11px; color: var(--text-faint); margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">
+    <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.8">
+      <rect x="2" y="4.5" width="14" height="15" rx="3"/>
+      <path d="M16 9.8l4.6-2.7a.8.8 0 0 1 1.2.7v9.2a.8.8 0 0 1-1.2.7L16 15" stroke-linejoin="round"/>
+    </svg>
+  </div>
+  <div>
+    <h1>Vidaio Miner CMS</h1>
+    <div class="subtitle">Compression outcomes &middot; live from real validator traffic</div>
+  </div>
+</header>
+
+<div id="alert-banner"></div>
+
+<nav>
+  <button class="tab active" data-view="overview">Overview</button>
+  <button class="tab" data-view="items">Items</button>
+  <button class="tab" data-view="health">CQ Health</button>
+  <button class="tab" data-view="calibration">Calibration</button>
+  <button class="tab" data-view="library">Library</button>
+</nav>
+
+<!-- OVERVIEW -->
+<div class="view active" id="view-overview">
+  <div class="stats" id="overview-stats"></div>
+  <div class="grid-2">
+    <div class="panel">
+      <div class="panel-head">Score trend <span class="hint">daily average, last 14 days</span></div>
+      <div class="panel-body"><svg class="chart" id="score-trend-chart"></svg></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">Rate-distortion <span class="hint">VMAF vs. compression ratio</span></div>
+      <div class="panel-body">
+        <svg class="chart" id="rd-scatter-chart"></svg>
+        <div class="chart-tooltip-hint">Each point is one item. Lower-right = more compression at higher quality.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ITEMS -->
+<div class="view" id="view-items">
+  <div class="panel">
+    <div class="controls">
+      <select id="filter-codec"><option value="">All codecs</option></select>
+      <select id="filter-threshold"><option value="">All thresholds</option></select>
+      <button class="btn" onclick="loadItems()">Refresh</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th data-sort="ts">Time</th><th>Task</th><th data-sort="cq">CQ</th>
+        <th data-sort="vmaf">VMAF</th><th data-sort="ratio">Ratio</th><th data-sort="score">Score</th>
+        <th data-sort="elapsed_seconds">Elapsed</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <div class="panel" id="detail">
+    <div class="panel-head"><span>Item detail</span><span class="task-id" id="detail-task"></span></div>
+    <div class="panel-body" id="detail-body"></div>
+  </div>
+</div>
+
+<!-- CQ HEALTH -->
+<div class="view" id="view-health">
+  <div class="panel">
+    <div class="panel-head">CQ table health <span class="hint">current default vs. best real-scored value seen in calibration</span></div>
+    <table>
+      <thead><tr><th>Table</th><th>Tier</th><th>Threshold</th><th>Current CQ</th><th>Best known</th><th>Status</th></tr></thead>
+      <tbody id="health-rows"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- CALIBRATION -->
+<div class="view" id="view-calibration">
+  <div class="panel">
+    <div class="panel-head">Run calibration</div>
+    <div class="panel-body">
+      <form class="cal-form" onsubmit="startCalibration(event)">
+        <select id="cal-codec"><option value="hevc">hevc</option><option value="av1">av1</option></select>
+        <input id="cal-threshold" type="number" step="0.1" value="85.0" style="width:80px" placeholder="threshold">
+        <input id="cal-grid" type="text" value="30,33,35,38,40" style="width:160px" placeholder="cq grid">
+        <input id="cal-limit" type="number" value="6" style="width:60px" placeholder="clips">
+        <button class="btn primary" type="submit">Start run</button>
+      </form>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">Recent runs</div>
+    <div class="panel-body" id="runs-body"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">Calibration log</div>
+    <table>
+      <thead><tr><th>Task</th><th>Codec</th><th>Threshold</th><th>CQ</th><th>VMAF</th><th>Ratio</th></tr></thead>
+      <tbody id="cal-log-rows"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- LIBRARY -->
+<div class="view" id="view-library">
+  <div class="panel">
+    <div class="panel-head">Coverage <span class="hint">reference clips by category, cap 80 total, reserve 3 per category</span></div>
+    <div class="panel-body"><div class="coverage-grid" id="coverage-grid"></div></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">Recent clips</div>
+    <div class="panel-body"><div class="thumb-grid" id="thumb-grid"></div></div>
+  </div>
+</div>
+
+<script>
+function switchView(view) {
+  document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + view));
+  if (view === 'health') loadHealth();
+  if (view === 'calibration') { loadRuns(); loadCalLog(); }
+  if (view === 'library') loadLibrary();
+}
+document.querySelectorAll('.tab').forEach(b => b.onclick = () => switchView(b.dataset.view));
+
+function scoreClass(s) {
+  if (s === null || s === undefined) return '';
+  if (s >= 0.5) return 'hi';
+  if (s >= 0.15) return 'mid';
+  return 'lo';
+}
+
+async function loadAlerts() {
+  const alerts = await (await fetch('/api/alerts?limit=8')).json();
+  const el = document.getElementById('alert-banner');
+  if (!alerts.length) { el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  el.innerHTML = alerts.map(a => `
+    <div class="alert-row ${a.severity}">
+      <span class="alert-dot"></span>
+      <span>${a.message}</span>
+      <span class="alert-time">${(a.ts||'').replace('T',' ').slice(0,19)}</span>
+    </div>`).join('');
+}
+
+async function loadOverview() {
+  const [stats, health, alerts] = await Promise.all([
+    fetch('/api/stats').then(r => r.json()),
+    fetch('/api/cq-health').then(r => r.json()),
+    fetch('/api/alerts?limit=100').then(r => r.json()),
+  ]);
+  const staleTiers = health.filter(h => !h.calibrated).length;
+  const critAlerts = alerts.filter(a => a.severity === 'critical').length;
+  const avgScore = stats.by_category.length
+    ? stats.by_category.reduce((s, c) => s + (c.avg_score||0)*c.n, 0) / Math.max(1, stats.total_items)
+    : null;
+  document.getElementById('overview-stats').innerHTML = `
+    <div class="stat-card"><b>${stats.total_items}</b>total items logged</div>
+    <div class="stat-card ${avgScore >= 0.4 ? 'ok' : avgScore >= 0.15 ? 'warn' : ''}"><b>${avgScore !== null ? avgScore.toFixed(3) : '-'}</b>overall avg score</div>
+    <div class="stat-card ${staleTiers === 0 ? 'ok' : 'warn'}"><b>${staleTiers}</b>/${health.length} CQ tiers uncalibrated</div>
+    <div class="stat-card ${critAlerts === 0 ? 'ok' : 'crit'}"><b>${critAlerts}</b>critical alerts</div>
+  `;
+  drawScoreTrend();
+  drawRateDistortion();
+}
+
+function svgLine(points, w, h, pad, color) {
+  if (!points.length) return '';
+  const xs = points.map(p => p.x), ys = points.map(p => p.y);
+  const xMin = Math.min(...xs), xMax = Math.max(...xs) || 1;
+  const yMin = 0, yMax = Math.max(...ys, 0.01);
+  const sx = x => pad + (x - xMin) / (xMax - xMin || 1) * (w - 2*pad);
+  const sy = y => h - pad - (y - yMin) / (yMax - yMin || 1) * (h - 2*pad);
+  const path = points.map((p,i) => `${i===0?'M':'L'}${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`).join(' ');
+  const dots = points.map(p => `<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="2.5" fill="${color}"/>`).join('');
+  return `<path d="${path}" fill="none" stroke="${color}" stroke-width="2"/>${dots}`;
+}
+
+async function drawScoreTrend() {
+  const rows = await (await fetch('/api/score-trend?days=14')).json();
+  const svg = document.getElementById('score-trend-chart');
+  const w = svg.clientWidth || 500, h = 220, pad = 28;
+  if (!rows.length) { svg.innerHTML = `<text x="${w/2}" y="${h/2}" fill="#565f74" font-size="12" text-anchor="middle">No score data yet</text>`; return; }
+  const points = rows.map((r,i) => ({ x: i, y: r.avg_score || 0 }));
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  let grid = '';
+  for (let g = 0; g <= 1; g += 0.25) {
+    const y = h - pad - g * (h - 2*pad);
+    grid += `<line x1="${pad}" y1="${y}" x2="${w-pad}" y2="${y}" stroke="#232836" stroke-width="1"/>`;
+    grid += `<text x="4" y="${y+3}" fill="#565f74" font-size="10">${g.toFixed(2)}</text>`;
+  }
+  svg.innerHTML = grid + svgLine(points, w, h, pad, '#6366f1') +
+    rows.map((r,i) => `<title>${r.day}: avg ${r.avg_score?.toFixed(3)} (n=${r.n})</title>`).join('');
+}
+
+async function drawRateDistortion() {
+  const rows = await (await fetch('/api/rate-distortion?limit=500')).json();
+  const svg = document.getElementById('rd-scatter-chart');
+  const w = svg.clientWidth || 500, h = 220, pad = 30;
+  if (!rows.length) { svg.innerHTML = `<text x="${w/2}" y="${h/2}" fill="#565f74" font-size="12" text-anchor="middle">No data yet</text>`; return; }
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  const sx = ratio => pad + Math.min(ratio, 1) * (w - 2*pad);
+  const sy = vmaf => h - pad - Math.max(0, Math.min(vmaf, 100)) / 100 * (h - 2*pad);
+  const colors = { hevc: '#6366f1', av1: '#34d399' };
+  let grid = '';
+  [0, 50, 100].forEach(v => {
+    const y = sy(v);
+    grid += `<line x1="${pad}" y1="${y}" x2="${w-pad}" y2="${y}" stroke="#232836" stroke-width="1"/><text x="4" y="${y+3}" fill="#565f74" font-size="10">${v}</text>`;
+  });
+  const dots = rows.map(r => {
+    const color = colors[(r.codec||'').toLowerCase()] || '#8b93a7';
+    return `<circle cx="${sx(r.ratio).toFixed(1)}" cy="${sy(r.vmaf).toFixed(1)}" r="3" fill="${color}" fill-opacity="0.7"><title>${r.task_id} vmaf=${r.vmaf?.toFixed(1)} ratio=${r.ratio?.toFixed(3)}</title></circle>`;
+  }).join('');
+  svg.innerHTML = grid + dots;
+}
+
+let itemSort = { col: 'ts', dir: 'desc' };
+async function loadFilters() {
+  const stats = await (await fetch('/api/stats')).json();
+  const codecs = [...new Set(stats.by_category.map(c => c.codec))];
+  const thresholds = [...new Set(stats.by_category.map(c => c.vmaf_threshold))];
+  const codecSel = document.getElementById('filter-codec');
+  const thrSel = document.getElementById('filter-threshold');
+  codecs.forEach(c => codecSel.innerHTML += `<option value="${c}">${c}</option>`);
+  thresholds.forEach(t => thrSel.innerHTML += `<option value="${t}">${t}</option>`);
+}
+document.querySelectorAll('th[data-sort]').forEach(th => th.onclick = () => {
+  const col = th.dataset.sort;
+  itemSort.dir = (itemSort.col === col && itemSort.dir === 'desc') ? 'asc' : 'desc';
+  itemSort.col = col;
+  loadItems();
+});
+async function loadItems() {
+  const codec = document.getElementById('filter-codec').value;
+  const threshold = document.getElementById('filter-threshold').value;
+  const params = new URLSearchParams({ limit: 200, sort: itemSort.col, order: itemSort.dir });
+  if (codec) params.set('codec', codec);
+  if (threshold) params.set('vmaf_threshold', threshold);
+  const items = await (await fetch(`/api/items?${params}`)).json();
+  document.querySelectorAll('th[data-sort]').forEach(th => th.classList.toggle('sorted', th.dataset.sort === itemSort.col));
+  const rowsEl = document.getElementById('rows');
+  if (!items.length) {
+    rowsEl.innerHTML = `<tr><td colspan="7"><div class="empty">No items match this filter yet.</div></td></tr>`;
+    return;
+  }
+  rowsEl.innerHTML = items.map(it => `
+    <tr onclick="showDetail('${it.task_id}')">
+      <td>${(it.ts||'').replace('T',' ').slice(0,19)}</td>
+      <td class="task">${it.task_id} <span class="pill">${it.codec||''} ${it.vmaf_threshold??''}</span></td>
+      <td>${it.cq ?? ''}</td>
+      <td>${it.vmaf?.toFixed(2) ?? ''}</td>
+      <td>${it.ratio?.toFixed(3) ?? ''}</td>
+      <td>${it.score !== null && it.score !== undefined ? `<span class="score-pill ${scoreClass(it.score)}">${it.score.toFixed(3)}</span>` : ''}</td>
+      <td>${it.elapsed_seconds?.toFixed(1) ?? ''}s</td>
+    </tr>`).join('');
+}
+async function showDetail(taskId) {
+  const it = await (await fetch(`/api/items/${taskId}`)).json();
+  const det = document.getElementById('detail');
+  det.style.display = 'block';
+  document.getElementById('detail-task').textContent = taskId;
+  const refVideo = it.has_reference_sample ? `<div class="video-card"><video controls src="/video/${taskId}/reference"></video><div class="video-label">Reference</div></div>` : '';
+  const compVideo = it.has_compressed_sample ? `<div class="video-card"><video controls src="/video/${taskId}/compressed"></video><div class="video-label">Compressed</div></div>` : '';
+  const noVideo = (!it.has_reference_sample && !it.has_compressed_sample) ? '<div class="missing">No video sample retained for this item.</div>' : '';
+  document.getElementById('detail-body').innerHTML = `
+    <div class="detail-meta">
+      <span><b>${it.codec} ${it.codec_mode}</b></span>
+      <span>threshold <b>${it.vmaf_threshold}</b></span>
+      <span>cq <b>${it.cq}</b></span>
+      <span>vmaf <b>${it.vmaf?.toFixed(2) ?? '-'}</b></span>
+      <span>ratio <b>${it.ratio?.toFixed(4) ?? '-'}</b></span>
+      <span>score <b>${it.score?.toFixed(4) ?? '-'}</b></span>
+      <span><b>${it.original_size}</b> &rarr; <b>${it.compressed_size}</b> bytes</span>
+      <span>elapsed <b>${it.elapsed_seconds?.toFixed(1)}s</b></span>
+      <span>${it.searched ? 'search-driven' : 'static table'}</span>
+    </div>
+    <div class="videos">${refVideo}${compVideo}${noVideo}</div>`;
+  det.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function loadHealth() {
+  const rows = await (await fetch('/api/cq-health')).json();
+  document.getElementById('health-rows').innerHTML = rows.map(r => {
+    let badge, label;
+    if (!r.calibrated) { badge = 'none'; label = 'no evidence'; }
+    else if (r.matches_best) { badge = 'match'; label = 'matches best known'; }
+    else { badge = 'gap'; label = `best known: ${r.best_known_cq} (score ${r.best_known_score})`; }
+    return `<tr class="health-row">
+      <td>${r.table}</td><td>${r.tier}</td><td>${r.threshold}</td><td>${r.current_cq}</td>
+      <td>${r.best_known_cq ?? '-'}</td>
+      <td><span class="health-badge ${badge}">${label}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+async function startCalibration(ev) {
+  ev.preventDefault();
+  const codec = document.getElementById('cal-codec').value;
+  const threshold = document.getElementById('cal-threshold').value;
+  const grid = document.getElementById('cal-grid').value;
+  const limit = document.getElementById('cal-limit').value;
+  const params = new URLSearchParams({ codec, vmaf_threshold: threshold, cq_grid: grid, limit_clips: limit });
+  await fetch(`/api/calibration/start?${params}`, { method: 'POST' });
+  loadRuns();
+}
+async function loadRuns() {
+  const runs = await (await fetch('/api/calibration/runs')).json();
+  document.getElementById('runs-body').innerHTML = runs.length ? runs.map(r => `
+    <div class="run-row">
+      <span class="run-status ${r.status}">${r.status.toUpperCase()}</span>
+      &mdash; ${r.codec} thr${r.vmaf_threshold}, grid [${r.cq_grid}], ${r.limit_clips} clips
+      &middot; started ${(r.started_at||'').replace('T',' ').slice(0,19)}
+      <pre class="log-tail">${(r.log_tail || 'waiting for output...').slice(-2000)}</pre>
+    </div>`).join('') : '<div class="empty">No calibration runs yet.</div>';
+}
+async function loadCalLog() {
+  const rows = await (await fetch('/api/calibration/log?limit=100')).json();
+  document.getElementById('cal-log-rows').innerHTML = rows.length ? rows.map(r => `
+    <tr><td class="task">${r.task_id||''}</td><td>${r.codec||''}</td><td>${r.vmaf_threshold??''}</td>
+    <td>${r.cq??''}</td><td>${r.vmaf?.toFixed(2)??''}</td><td>${r.ratio?.toFixed(3)??''}</td></tr>
+  `).join('') : `<tr><td colspan="6"><div class="empty">No calibration data yet.</div></td></tr>`;
+}
+
+async function loadLibrary() {
+  const [coverage, clips] = await Promise.all([
+    fetch('/api/library/coverage').then(r => r.json()),
+    fetch('/api/library/clips').then(r => r.json()),
+  ]);
+  document.getElementById('coverage-grid').innerHTML = coverage.map(c => `
+    <div class="coverage-cell ${c.thin ? 'thin' : ''}"><b>${c.count}</b>${c.codec} / thr${c.vmaf_threshold}${c.thin ? ' &middot; thin' : ''}</div>
+  `).join('') || '<div class="empty">No clips captured yet.</div>';
+  document.getElementById('thumb-grid').innerHTML = clips.slice(0, 40).map(c => `
+    <div class="thumb-card">
+      <img src="/thumbnail/${c.task_id}" loading="lazy" onerror="this.style.display='none'">
+      <div class="thumb-meta">${c.codec||''} thr${c.vmaf_threshold||''}</div>
+    </div>`).join('') || '<div class="empty">No clips captured yet.</div>';
+}
+
+loadAlerts(); loadOverview(); loadFilters(); loadItems();
+setInterval(() => { loadAlerts(); loadOverview(); if (document.getElementById('view-items').classList.contains('active')) loadItems(); }, 20000);
+</script>
+</body></html>
