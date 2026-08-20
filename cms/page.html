@@ -99,10 +99,44 @@
   #detail .panel-head .task-id { font-family: ui-monospace, monospace; color: var(--text); font-size: 13px; font-weight: 600; text-transform: none; }
   .detail-meta { font-size: 12.5px; color: var(--text-dim); display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
   .detail-meta span b { color: var(--text); font-weight: 600; }
-  .videos { display: flex; gap: 16px; flex-wrap: wrap; }
-  .video-card { flex: 1; min-width: 280px; max-width: 460px; }
-  .video-card video { width: 100%; background: #000; border-radius: 8px; display: block; border: 1px solid var(--border); }
-  .video-label { font-size: 11px; color: var(--text-faint); margin-top: 6px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+  .compare {
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 16px; overflow: hidden;
+  }
+  .compare-videos { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 720px) { .compare-videos { grid-template-columns: 1fr; } }
+  .compare-cell { position: relative; border-radius: 9px; overflow: hidden; background: #000; border: 1px solid var(--border); aspect-ratio: 16/9; }
+  .compare-cell video { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
+  .compare-chip {
+    position: absolute; top: 10px; left: 10px; z-index: 2;
+    padding: 3px 9px; border-radius: 999px; font-size: 10.5px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.05em; backdrop-filter: blur(6px);
+  }
+  .compare-chip.reference { background: rgba(99,102,241,0.28); color: #c7c8ff; border: 1px solid rgba(99,102,241,0.4); }
+  .compare-chip.compressed { background: rgba(52,211,153,0.24); color: #a7f3d3; border: 1px solid rgba(52,211,153,0.4); }
+  .compare-size {
+    position: absolute; bottom: 8px; right: 10px; z-index: 2; font-size: 10.5px; color: rgba(255,255,255,0.75);
+    background: rgba(0,0,0,0.5); padding: 2px 7px; border-radius: 6px; font-variant-numeric: tabular-nums;
+  }
+  .compare-loading {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 11px; color: var(--text-faint); background: #000; z-index: 1;
+  }
+  .compare-controls { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+  .compare-playbtn {
+    width: 34px; height: 34px; border-radius: 50%; background: var(--accent); border: none; color: white;
+    display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; font-size: 13px;
+  }
+  .compare-playbtn:hover { background: #7678f5; }
+  .compare-seek {
+    flex: 1; -webkit-appearance: none; appearance: none; height: 4px; border-radius: 999px;
+    background: var(--border); outline: none; cursor: pointer;
+  }
+  .compare-seek::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%; background: var(--accent);
+    border: 2px solid #1a1f26; cursor: pointer;
+  }
+  .compare-time { font-size: 11.5px; color: var(--text-dim); font-variant-numeric: tabular-nums; flex-shrink: 0; min-width: 80px; text-align: right; }
   .missing { color: var(--text-faint); font-style: italic; padding: 24px; text-align: center; font-size: 13px; }
 
   .health-row td { padding: 9px 18px; }
@@ -388,14 +422,101 @@ async function loadItems() {
       <td>${it.elapsed_seconds?.toFixed(1) ?? ''}s</td>
     </tr>`).join('');
 }
+function fmtTime(s) {
+  if (!isFinite(s)) return '0:00';
+  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+function fmtBytes(n) {
+  if (n === null || n === undefined) return '-';
+  if (n > 1e6) return (n / 1e6).toFixed(1) + ' MB';
+  if (n > 1e3) return (n / 1e3).toFixed(0) + ' KB';
+  return n + ' B';
+}
+
+let compareState = null; // { videos: [el, el], playing: bool }
+
+function bindCompareViewer(taskId) {
+  const videos = [
+    document.getElementById('cmp-video-reference'),
+    document.getElementById('cmp-video-compressed'),
+  ].filter(Boolean);
+  if (!videos.length) return;
+
+  const master = videos[0];
+  const playBtn = document.getElementById('cmp-play');
+  const seek = document.getElementById('cmp-seek');
+  const timeEl = document.getElementById('cmp-time');
+  const loadingEls = document.querySelectorAll(`#cmp-container-${taskId} .compare-loading`);
+  let ready = 0;
+
+  videos.forEach((v, i) => {
+    v.addEventListener('loadeddata', () => {
+      ready++;
+      const el = v.closest('.compare-cell')?.querySelector('.compare-loading');
+      if (el) el.style.display = 'none';
+      if (ready === videos.length && master.duration) {
+        seek.max = master.duration;
+        timeEl.textContent = `0:00 / ${fmtTime(master.duration)}`;
+      }
+    });
+  });
+
+  function playAll() { videos.forEach(v => v.play()); playBtn.textContent = '⏸'; }
+  function pauseAll() { videos.forEach(v => v.pause()); playBtn.textContent = '▶'; }
+
+  playBtn.onclick = () => {
+    if (master.paused) playAll(); else pauseAll();
+  };
+
+  master.addEventListener('timeupdate', () => {
+    if (!seek.matches(':active')) seek.value = master.currentTime;
+    timeEl.textContent = `${fmtTime(master.currentTime)} / ${fmtTime(master.duration || 0)}`;
+    // Nudge any follower video back in sync if it's drifted noticeably --
+    // independent <video> elements decoding separately-encoded files can
+    // drift a little over time even started together.
+    for (let i = 1; i < videos.length; i++) {
+      if (Math.abs(videos[i].currentTime - master.currentTime) > 0.2) {
+        videos[i].currentTime = master.currentTime;
+      }
+    }
+  });
+  master.addEventListener('ended', () => { playBtn.textContent = '▶'; });
+
+  seek.addEventListener('input', () => {
+    videos.forEach(v => { v.currentTime = seek.valueAsNumber; });
+  });
+}
+
 async function showDetail(taskId) {
   const it = await (await fetch(`/api/items/${taskId}`)).json();
   const det = document.getElementById('detail');
   det.style.display = 'block';
   document.getElementById('detail-task').textContent = taskId;
-  const refVideo = it.has_reference_sample ? `<div class="video-card"><video controls src="/video/${taskId}/reference"></video><div class="video-label">Reference</div></div>` : '';
-  const compVideo = it.has_compressed_sample ? `<div class="video-card"><video controls src="/video/${taskId}/compressed"></video><div class="video-label">Compressed</div></div>` : '';
-  const noVideo = (!it.has_reference_sample && !it.has_compressed_sample) ? '<div class="missing">No video sample retained for this item.</div>' : '';
+
+  const cells = [];
+  if (it.has_reference_sample) cells.push({ kind: 'reference', label: 'Reference', bytes: it.original_size });
+  if (it.has_compressed_sample) cells.push({ kind: 'compressed', label: 'Compressed', bytes: it.compressed_size });
+
+  const videoHtml = cells.length ? `
+    <div class="compare" id="cmp-container-${taskId}">
+      <div class="compare-videos">
+        ${cells.map(c => `
+          <div class="compare-cell">
+            <div class="compare-loading">loading&hellip;</div>
+            <span class="compare-chip ${c.kind}">${c.label}</span>
+            <span class="compare-size">${fmtBytes(c.bytes)}</span>
+            <video id="cmp-video-${c.kind}" src="/video/${taskId}/${c.kind}" muted playsinline></video>
+          </div>`).join('')}
+      </div>
+      ${cells.length > 1 ? `
+      <div class="compare-controls">
+        <button class="compare-playbtn" id="cmp-play">&#9654;</button>
+        <input type="range" class="compare-seek" id="cmp-seek" value="0" step="0.05">
+        <span class="compare-time" id="cmp-time">0:00 / 0:00</span>
+      </div>` : ''}
+    </div>` : '<div class="missing">No video sample retained for this item.</div>';
+
   document.getElementById('detail-body').innerHTML = `
     <div class="detail-meta">
       <span><b>${it.codec} ${it.codec_mode}</b></span>
@@ -408,7 +529,8 @@ async function showDetail(taskId) {
       <span>elapsed <b>${it.elapsed_seconds?.toFixed(1)}s</b></span>
       <span>${it.searched ? 'search-driven' : 'static table'}</span>
     </div>
-    <div class="videos">${refVideo}${compVideo}${noVideo}</div>`;
+    ${videoHtml}`;
+  if (cells.length > 1) bindCompareViewer(taskId);
   det.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
