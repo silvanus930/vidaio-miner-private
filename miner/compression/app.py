@@ -303,6 +303,57 @@ def _log_cq_search_sample(
     except OSError as exc:
         log.warning(f"[{task_label}] failed to write cq search log sample: {exc}")
 
+
+# One record per fully-completed compression request. This is the only
+# place vmaf/cq/ratio/timing for a real item ever gets persisted -- the
+# CompressResponse returned to neurons/miner.py carries only output_paths/
+# success (see CompressResponse), so this log is the CMS's actual data
+# source rather than a change to that request/response contract.
+COMPRESSION_OUTCOME_LOG_PATH = os.getenv(
+    "COMPRESSION_OUTCOME_LOG_PATH",
+    os.path.join(PERSISTENT_DATA_DIR, "compression_outcomes.jsonl"),
+)
+
+
+def _log_compression_outcome(
+    *,
+    task_label: str,
+    req: "CompressRequest",
+    resolved_cq: int | None,
+    vmaf: float | None,
+    original_size: int,
+    compressed_size: int,
+    elapsed_seconds: float,
+    searched: bool,
+    reference_path: str,
+    compressed_path: str,
+) -> None:
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "task_id": task_label,
+        "codec": req.codec,
+        "codec_mode": req.codec_mode,
+        "vmaf_threshold": req.vmaf_threshold,
+        "target_bitrate": req.target_bitrate,
+        "compression_type": req.compression_type,
+        "cq": resolved_cq,
+        "vmaf": vmaf,
+        "original_size": original_size,
+        "compressed_size": compressed_size,
+        "ratio": (compressed_size / original_size) if original_size else None,
+        "elapsed_seconds": elapsed_seconds,
+        "searched": searched,
+        "reference_path": reference_path,
+        "compressed_path": compressed_path,
+    }
+    try:
+        os.makedirs(PERSISTENT_DATA_DIR, exist_ok=True)
+        with open(COMPRESSION_OUTCOME_LOG_PATH, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        log.warning(f"[{task_label}] failed to write compression outcome log: {exc}")
+
+
 # Storage provider label only. Uploads use one S3-compatible code path.
 STORAGE_PROVIDER = os.getenv("MINER_STORAGE_PROVIDER", "s3").lower()
 S3_REGION = os.getenv("MINER_STORAGE_S3_REGION", "us-east-1").strip() or "us-east-1"
@@ -933,7 +984,7 @@ async def _search_cq_for_max_score(
     encoder: str,
     task_label: str,
     deadline: float | None = None,
-) -> int:
+) -> tuple[int, float | None]:
     """Local search over AV1 CQ that directly maximizes the real compression
     score (probe-encode, measure real size + VMAF, score it), instead of
     trusting a fixed per-band guess. Starts near the static table's value and
@@ -945,6 +996,10 @@ async def _search_cq_for_max_score(
     early against whichever of CQ_SEARCH_MAX_SECONDS or the remaining
     request budget is tighter, so a slow queue wait doesn't leave the final
     encode without enough time to finish before the validator's own timeout.
+
+    Returns (chosen_cq, vmaf_at_that_cq) -- vmaf is None whenever no probe
+    ran or succeeded (pure fallback), so callers logging the outcome know
+    not to report a fabricated measurement.
     """
     fallback_cq = resolve_compression_cq(
         explicit_cq=None,
@@ -954,14 +1009,14 @@ async def _search_cq_for_max_score(
         encoder_mode=req.encoder_mode,
     )
     if not CQ_SEARCH_ENABLED or req.vmaf_threshold is None:
-        return fallback_cq
+        return fallback_cq, None
 
     try:
         original_size = os.path.getsize(local_input)
     except OSError:
-        return fallback_cq
+        return fallback_cq, None
     if original_size <= 0:
-        return fallback_cq
+        return fallback_cq, None
 
     resolution = await _probe_resolution(local_input, task_label)
     size_bonus = _size_based_cq_bonus(req.vmaf_threshold, req.codec, resolution, original_size)
@@ -981,7 +1036,7 @@ async def _search_cq_for_max_score(
         log.warning(
             f"[{task_label}] no time budget left for cq search, using fallback cq={fallback_cq}"
         )
-        return fallback_cq
+        return fallback_cq, None
 
     n_subsample = req.vmaf_n_subsample or (
         _vmaf_subsample_for_resolution(*resolution, available_seconds=max_seconds)
@@ -1185,11 +1240,11 @@ async def _search_cq_for_max_score(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     if not tried:
-        return fallback_cq
+        return fallback_cq, None
     best_cq = max(tried, key=tried.get)
     if tried[best_cq] <= 0.0:
-        return fallback_cq
-    return best_cq
+        return fallback_cq, None
+    return best_cq, probed_vmaf.get(best_cq)
 
 
 def _should_chunk(req: "CompressRequest", duration_seconds: float | None) -> bool:
@@ -1881,6 +1936,7 @@ async def _compress_one(
             duration_seconds = await _probe_duration_seconds(local_input, task_label)
             use_chunked = _should_chunk(req, duration_seconds)
 
+            searched_vmaf = None
             if (
                 CQ_SEARCH_ENABLED
                 and req.codec_mode != "VBR"
@@ -1892,7 +1948,7 @@ async def _compress_one(
                     or duration_seconds <= CQ_SEARCH_MAX_DURATION_SECONDS
                 )
             ):
-                searched_cq = await _search_cq_for_max_score(
+                searched_cq, searched_vmaf = await _search_cq_for_max_score(
                     local_input,
                     req,
                     encoder,
@@ -1977,6 +2033,29 @@ async def _compress_one(
             return CompressResponse(
                 success=False, errors=["Output file not created"], **stats
             )
+
+        try:
+            final_cq = resolve_compression_cq(
+                explicit_cq=req.cq,
+                compression_type=req.compression_type,
+                vmaf_threshold=req.vmaf_threshold,
+                codec=req.codec,
+                encoder_mode=req.encoder_mode,
+            )
+            _log_compression_outcome(
+                task_label=task_label,
+                req=req,
+                resolved_cq=final_cq,
+                vmaf=searched_vmaf,
+                original_size=os.path.getsize(local_input),
+                compressed_size=os.path.getsize(output_path),
+                elapsed_seconds=time.monotonic() - item_start,
+                searched=searched_vmaf is not None,
+                reference_path=local_input,
+                compressed_path=output_path,
+            )
+        except OSError as exc:
+            log.warning(f"[{task_label}] failed to record compression outcome: {exc}")
 
         # --- Remote mode: upload result to S3, return URL ---
         if remote_mode:

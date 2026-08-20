@@ -148,6 +148,24 @@ REAL_CONTENT_LIBRARY_MAX_FILES = int(
 REAL_CONTENT_LIBRARY_MIN_PER_CATEGORY = int(
     os.getenv("MINER_REAL_CONTENT_LIBRARY_MIN_PER_CATEGORY", "3")
 )
+# Mirrors the reference library above, but for the actual compressed output
+# -- needed so a CMS/dashboard can show a real before/after preview instead
+# of just the reference clip. Compressed outputs are normally deleted
+# within seconds of upload (by design, to keep disk usage bounded), so this
+# is the only place they'd ever survive long enough to preview. Same
+# category-aware cap and reserve as the reference library (see
+# _sample_category / _pick_eviction_victim, reused for both).
+COMPRESSED_SAMPLE_LIBRARY_ENABLED = os.getenv(
+    "MINER_COMPRESSED_SAMPLE_LIBRARY_ENABLED", "true"
+).lower() in ("1", "true", "yes")
+COMPRESSED_SAMPLE_LIBRARY_PATH = Path(
+    os.getenv(
+        "MINER_COMPRESSED_SAMPLE_LIBRARY_PATH", "/root/vidaio-compressed-sample-library"
+    )
+).expanduser()
+COMPRESSED_SAMPLE_LIBRARY_MAX_FILES = int(
+    os.getenv("MINER_COMPRESSED_SAMPLE_LIBRARY_MAX_FILES", "80")
+)
 
 HOST_SHARED_VOLUME_PATH = Path(
     os.getenv("MINER_SHARED_VOLUME_PATH")
@@ -590,12 +608,46 @@ class Miner(BaseMiner):
     async def _capture_reference_sample(self, host_path: Path, payload, task_id: str) -> None:
         if not REAL_CONTENT_LIBRARY_ENABLED:
             return
+        await self._capture_sample_to_library(
+            host_path,
+            payload,
+            task_id,
+            library_path=REAL_CONTENT_LIBRARY_PATH,
+            max_files=REAL_CONTENT_LIBRARY_MAX_FILES,
+            min_per_category=REAL_CONTENT_LIBRARY_MIN_PER_CATEGORY,
+            kind="real content",
+        )
+
+    async def _capture_compressed_sample(self, host_path: Path, payload, task_id: str) -> None:
+        if not COMPRESSED_SAMPLE_LIBRARY_ENABLED:
+            return
+        await self._capture_sample_to_library(
+            host_path,
+            payload,
+            task_id,
+            library_path=COMPRESSED_SAMPLE_LIBRARY_PATH,
+            max_files=COMPRESSED_SAMPLE_LIBRARY_MAX_FILES,
+            min_per_category=REAL_CONTENT_LIBRARY_MIN_PER_CATEGORY,
+            kind="compressed sample",
+        )
+
+    async def _capture_sample_to_library(
+        self,
+        host_path: Path,
+        payload,
+        task_id: str,
+        *,
+        library_path: Path,
+        max_files: int,
+        min_per_category: int,
+        kind: str,
+    ) -> None:
         try:
-            REAL_CONTENT_LIBRARY_PATH.mkdir(parents=True, exist_ok=True)
+            library_path.mkdir(parents=True, exist_ok=True)
             codec = str(getattr(payload, "target_codec", "unknown"))
             threshold = getattr(payload, "vmaf_threshold", "unknown")
             dest_name = f"{task_id}_{codec}_thr{threshold}.mp4"
-            dest_path = REAL_CONTENT_LIBRARY_PATH / dest_name
+            dest_path = library_path / dest_name
             await asyncio.to_thread(shutil.copy2, host_path, dest_path)
             meta = {
                 "task_id": task_id,
@@ -608,10 +660,10 @@ class Miner(BaseMiner):
             Path(f"{dest_path}.json").write_text(json.dumps(meta))
 
             samples = sorted(
-                REAL_CONTENT_LIBRARY_PATH.glob("*.mp4"), key=lambda p: p.stat().st_mtime
+                library_path.glob("*.mp4"), key=lambda p: p.stat().st_mtime
             )
-            while len(samples) > REAL_CONTENT_LIBRARY_MAX_FILES:
-                victim = self._pick_eviction_victim(samples)
+            while len(samples) > max_files:
+                victim = self._pick_eviction_victim(samples, min_per_category)
                 if victim is None:
                     # Every category is already at or below its reserve --
                     # can't evict without breaking that guarantee. Only
@@ -624,7 +676,7 @@ class Miner(BaseMiner):
                 victim.unlink(missing_ok=True)
                 Path(f"{victim}.json").unlink(missing_ok=True)
         except Exception as e:
-            logger.warning(f"Failed to capture real content sample for {task_id}: {e}")
+            logger.warning(f"Failed to capture {kind} sample for {task_id}: {e}")
 
     @staticmethod
     def _sample_category(mp4_path: Path) -> tuple[str, str]:
@@ -638,7 +690,7 @@ class Miner(BaseMiner):
             return ("unknown", "unknown")
 
     @classmethod
-    def _pick_eviction_victim(cls, samples: list[Path]) -> Path | None:
+    def _pick_eviction_victim(cls, samples: list[Path], min_per_category: int) -> Path | None:
         counts: dict[tuple[str, str], int] = {}
         for p in samples:
             cat = cls._sample_category(p)
@@ -649,7 +701,7 @@ class Miner(BaseMiner):
         best: Path | None = None
         best_surplus = 0
         for p in samples:  # already sorted oldest-first
-            surplus = counts[cls._sample_category(p)] - REAL_CONTENT_LIBRARY_MIN_PER_CATEGORY
+            surplus = counts[cls._sample_category(p)] - min_per_category
             if surplus > best_surplus:
                 best = p
                 best_surplus = surplus
@@ -1005,6 +1057,7 @@ class Miner(BaseMiner):
 
             output_host_path = self._host_shared_path(processed_ref)
             self._track_shared_file(output_host_path)
+            asyncio.create_task(self._capture_compressed_sample(output_host_path, payload, task_id))
             return await self._upload_processed_video(output_host_path, "compression", task_id)
         finally:
             self._cleanup_shared_files(input_host_path, output_host_path)
