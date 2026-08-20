@@ -13,6 +13,7 @@ import calibration
 import cq_health
 import db
 import library
+import preview
 from auth import require_auth
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
@@ -130,7 +131,10 @@ def video_reference(task_id: str, request: Request, user: str = Auth):
     path = _find_sample(REFERENCE_LIBRARY_PATH, task_id)
     if path is None:
         raise HTTPException(status_code=404, detail="reference sample not retained for this item")
-    return _stream_video(path, request)
+    playable = preview.get_preview(path, f"{task_id}_reference")
+    if playable is None:
+        raise HTTPException(status_code=500, detail="failed to prepare a browser-playable preview")
+    return _stream_video(playable, request)
 
 
 @app.get("/video/{task_id}/compressed")
@@ -138,7 +142,10 @@ def video_compressed(task_id: str, request: Request, user: str = Auth):
     path = _find_sample(COMPRESSED_LIBRARY_PATH, task_id)
     if path is None:
         raise HTTPException(status_code=404, detail="compressed sample not retained for this item")
-    return _stream_video(path, request)
+    playable = preview.get_preview(path, f"{task_id}_compressed")
+    if playable is None:
+        raise HTTPException(status_code=500, detail="failed to prepare a browser-playable preview")
+    return _stream_video(playable, request)
 
 
 # --- CQ table health ----------------------------------------------------
