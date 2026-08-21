@@ -1204,9 +1204,23 @@ async def _search_cq_for_max_score(
                 slope_for_aim = (
                     slope_actual if abs(cq_gap) >= 2 else -CQ_SEARCH_SLOPE_PRIOR
                 )
-                if slope_for_aim < -0.1:
+                # Real production data (av1/93, av1/89 tiers) showed the
+                # measured local slope near a comfortably-cleared threshold
+                # is often nearly flat (~0.1 VMAF/cq, vs. the 1.7 pooled
+                # prior) -- VMAF saturates near its ceiling, so a strict
+                # "< -0.1" comparison let an exactly-flat measurement (which
+                # floating point rounds to precisely -0.1) fall through and
+                # skip the second jump entirely, stranding the search 2-8
+                # VMAF points above threshold with two probes' worth of
+                # budget left unused. "<=" closes that edge case; the wider
+                # +/-14 cap (was +/-8) gives the aim jump enough reach to
+                # actually cross the plateau in one probe instead of
+                # under-shooting it, since a near-zero measured slope means
+                # the *true* delta-to-threshold is almost always larger than
+                # the old cap could express.
+                if slope_for_aim <= -0.1:
                     delta2 = (vmaf1 - search_threshold) / (-slope_for_aim)
-                    delta2 = max(-8.0, min(8.0, delta2))
+                    delta2 = max(-14.0, min(14.0, delta2))
                     jump2 = min(CQ_SEARCH_MAX, max(CQ_SEARCH_MIN, round(jump1 + delta2)))
                     if jump2 not in tried:
                         await probe_score(jump2)
@@ -1502,7 +1516,18 @@ async def _cleanup_shared_volume_once():
         # log) that this TTL/quota sweep must never treat as scratch --
         # pruning it from os.walk's traversal (not just skipping matched
         # files) also protects anything nested inside it in the future.
-        dirs[:] = [d for d in dirs if os.path.join(root, d) != PERSISTENT_DATA_DIR]
+        # calib-library is the same story from a second, independent
+        # cleanup sweep: a calibration run stages its input clips there and
+        # deliberately runs for hours (throttled behind live traffic), well
+        # past TEMP_FILE_TTL_SECONDS -- this sweep doesn't know those files
+        # are still needed (calibrate_cq_curve.py is a separate process, not
+        # tracked by _protected_paths_snapshot) and was silently deleting
+        # them out from under a running calibration.
+        dirs[:] = [
+            d for d in dirs
+            if os.path.join(root, d) != PERSISTENT_DATA_DIR
+            and d != "calib-library"
+        ]
         for filename in files:
             path = os.path.abspath(os.path.join(root, filename))
             try:

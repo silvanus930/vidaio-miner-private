@@ -202,6 +202,11 @@ SHARED_VOLUME_CLEANUP_MIN_FILE_AGE_SECONDS = int(
 SHARED_VOLUME_CLEANUP_ENABLED = os.getenv(
     "MINER_CLEANUP_ENABLED", os.getenv("CLEANUP_ENABLED", "true")
 ).lower() in ("1", "true", "yes")
+# Subdirectories of the shared volume that stage their own inputs outside
+# the normal request lifecycle and so are never registered via
+# _track_shared_file -- excluded from the age/quota sweep entirely rather
+# than relying on that tracking.
+CLEANUP_EXCLUDED_DIR_NAMES = {"calib-library"}
 STORAGE_CLEANUP_ENABLED = os.getenv(
     "MINER_STORAGE_CLEANUP_ENABLED", os.getenv("STORAGE_CLEANUP_ENABLED", "true")
 ).lower() in ("1", "true", "yes")
@@ -449,6 +454,18 @@ class Miner(BaseMiner):
                 continue
 
             total_bytes += stat.st_size
+            if CLEANUP_EXCLUDED_DIR_NAMES & set(path.relative_to(HOST_SHARED_VOLUME_PATH).parts[:-1]):
+                # calib-library holds a calibration run's staged input clips.
+                # Those runs deliberately throttle themselves behind live
+                # traffic (see calibrate_cq_curve.py:wait_for_idle) and can
+                # take well over an hour -- long enough that ordinary organic
+                # traffic pushes the volume past the quota and this same
+                # sweep reclaims them as "oldest, unprotected" mid-run
+                # (observed live: a run died at point 47/60 with "Input file
+                # not found"). Calibration clips aren't tracked via
+                # _track_shared_file (that process doesn't share this
+                # instance's memory), so they need their own exemption.
+                continue
             normalized_path = self._normalize_shared_path(path)
             if normalized_path in protected_paths:
                 continue
